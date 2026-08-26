@@ -89,6 +89,7 @@ px4_add_romfs_files(
 	4016_gz_x500_lidar_down
 	4017_gz_x500_lidar_front
 	4018_gz_quadtailsitter
+	4022_gz_phoenixdrone
 	4019_gz_x500_gimbal
 	4020_gz_tiltrotor
 	4021_gz_x500_flow
