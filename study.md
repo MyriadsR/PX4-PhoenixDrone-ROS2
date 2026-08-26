@@ -638,3 +638,227 @@ ROS 2 demo
 ```
 
 这套修改的关键价值在于：不改 PX4 主控制器的大结构，而是在 ROS 2 侧复刻旧 PhoenixDrone 的控制律，通过 PX4 v1.16 的 direct actuator DDS 输入驱动 Gazebo Harmonic 中的新 PhoenixDrone 模型。
+
+## 11. 将 Tailsitter-control 控制器用于当前 PX4 仿真平台需要的工作
+
+如果要把 `/home/zr/Tailsitter-control` 项目里的控制器迁移到当前 `PX4-PhoenixDrone-ROS2` 仿真平台，不能只复制一个简单控制函数。该项目实际是一套完整的串级控制链路：
+
+```text
+参考轨迹 position/velocity/acceleration/jerk/yaw
+  -> 位置反馈控制
+  -> 线加速度 INDI
+  -> differential-flatness 姿态/推力求解
+  -> 姿态 PD + 角速度前馈
+  -> 角加速度 INDI
+  -> 双电机/双舵面分配
+  -> 执行器一阶动态 + 气动/动力学反馈
+```
+
+主循环主要在 `/home/zr/Tailsitter-control/main_sim.py` 中，核心控制模块包括：
+
+- `/home/zr/Tailsitter-control/controller/pos_ctrl.py`
+- `/home/zr/Tailsitter-control/controller/INDI_acc_ctrl.py`
+- `/home/zr/Tailsitter-control/controller/att_ctrl.py`
+- `/home/zr/Tailsitter-control/controller/actuator_ctrl.py`
+- `/home/zr/Tailsitter-control/environment/aerodynamics.py`
+- `/home/zr/Tailsitter-control/utils/filters.py`
+- `/home/zr/Tailsitter-control/config.py`
+
+### 11.1 推荐接入方式
+
+当前工程已经有 ROS 2 offboard 控制框架，因此最现实的做法是先把 Tailsitter-control 作为一个新的 ROS 2 节点接入，而不是直接移植成 PX4 内部 C++ 控制模块。
+
+建议新增类似下面的结构：
+
+```text
+ros2_ws/src/phoenix_offboard/phoenix_offboard/tailsitter_control/
+  __init__.py
+  config.py
+  filters.py
+  pos_ctrl.py
+  indi_acc_ctrl.py
+  att_ctrl.py
+  actuator_ctrl.py
+  math_utils.py
+
+ros2_ws/src/phoenix_offboard/phoenix_offboard/tailsitter_controller.py
+```
+
+新的 `tailsitter_controller.py` 负责：
+
+- 订阅 PX4 通过 uXRCE-DDS 输出的状态量。
+- 订阅或生成 `TrajectorySetpoint` 参考轨迹。
+- 调用 Tailsitter-control 的位置、加速度、姿态、角加速度和执行器分配控制律。
+- 发布 `OffboardControlMode`，并设置 `direct_actuator=True`。
+- 发布 `ActuatorMotors` 和 `ActuatorServos`。
+- 做解锁状态、数据超时、有限值检查和输出限幅。
+
+接入新控制器时，不能同时运行当前已有的 `phoenix_position_controller.py` 和 `phoenix_controller.py`，否则多个节点会同时向 PX4 写入控制输入，导致控制权冲突。
+
+### 11.2 需要对齐的状态输入
+
+Tailsitter-control 依赖的状态量比当前简化控制器更多。当前工程已有的 DDS 话题能提供一部分：
+
+- `/fmu/out/vehicle_attitude`：姿态四元数。
+- `/fmu/out/vehicle_angular_velocity`：机体系角速度。
+- `/fmu/out/vehicle_local_position`：NED 位置、速度，以及估计加速度字段。
+- `/fmu/out/vehicle_odometry`：位置、速度、姿态综合状态。
+- `/fmu/out/airspeed_validated`：空速相关估计。
+- `/fmu/in/actuator_motors`：电机 direct actuator 输入。
+- `/fmu/in/actuator_servos`：舵面 direct actuator 输入。
+- `/fmu/in/offboard_control_mode`：offboard 控制模式心跳。
+
+其中需要特别注意坐标系：
+
+- PX4 的世界坐标通常是 NED。
+- 机体系通常是 FRD。
+- `VehicleAttitude.q` 是 Hamilton 四元数 `[w, x, y, z]`，表示 FRD body 到 NED。
+- `VehicleAngularVelocity.xyz` 是 FRD 机体系角速度。
+- Tailsitter-control 里的数学推导和当前 PX4/Gazebo 数据之间必须逐项确认坐标方向、重力符号和四元数乘法顺序。
+
+Tailsitter-control 的 INDI 控制还需要线加速度和角加速度反馈。当前可以先用以下方式做最小实现：
+
+- 线加速度：先使用 `VehicleLocalPosition.ax/ay/az` 或从机体系加速度转换得到世界系加速度。
+- 角加速度：对 `VehicleAngularVelocity.xyz` 做低通滤波后差分。
+- 执行器反馈：先用上一周期指令加一阶执行器模型估计电机转速和舵面角度。
+
+更完整的实现应该把 Gazebo 中实际电机转速和舵面位置反馈回 ROS 2 或 PX4。否则 INDI 控制器拿到的是“估计执行器状态”，不是实际执行器状态，快速机动时误差会比较明显。
+
+### 11.3 需要补充或确认的 DDS topic
+
+当前 `src/modules/uxrce_dds_client/dds_topics.yaml` 中已经暴露了大部分 offboard 控制需要的话题。但如果要更接近 Tailsitter-control 原始控制律，建议检查并按需加入：
+
+- `VehicleAcceleration`：更直接的机体系加速度反馈。
+- 执行器实际状态相关 topic：用于拿到真实电机转速和舵面位置。
+- 调试输出 topic：用于记录 INDI 中间量、控制分配结果、滤波后的加速度和角加速度。
+
+其中 `VehicleAcceleration` 是否能直接用于线加速度控制，还要通过静止仿真测试确认符号。PX4 中该消息通常是机体系 FRD 下的加速度测量，可能包含重力或需要补偿重力，不能直接假设它等于世界系轨迹二阶导数。
+
+### 11.4 飞机参数不一致的问题
+
+Tailsitter-control 的参数和当前 Gazebo 模型差异很大，不能直接照搬增益和模型参数。
+
+Tailsitter-control 中的典型参数包括：
+
+- 质量约 `0.7 kg`。
+- 惯量约为 `diag([0.0095, 0.0030, 0.0115])`。
+- 电机力臂 `l_Ty=0.15 m`。
+- 舵面力臂 `l_dy=0.12 m`，`l_dx=0.075 m`。
+- 电机最大角速度 `2500 rad/s`。
+- 电机时间常数约 `0.04 s`。
+- 舵机时间常数约 `0.03 s`。
+- 舵面最大角度约 `1 rad`。
+- 控制频率 `500 Hz`。
+- INDI 常用 `15 Hz` Butterworth 低通滤波。
+
+当前 Gazebo PhoenixDrone 模型大致是：
+
+- 机体主体质量 `0.5 kg`，加上附加部件后总质量约 `0.525 kg`。
+- 惯量来自 `Tools/simulation/gz/models/phoenixdrone/model.sdf`。
+- 电机 y 向力臂约 `0.195 m`。
+- 电机最大角速度约 `800 rad/s`。
+- 电机力常数 `7.864e-6`。
+- 电机力矩常数约 `0.023`。
+- 电机上升/下降时间常数约 `0.016 s / 0.020 s`。
+
+因此必须重新整理一份当前 PX4/Gazebo 模型专用的 `config.py`。最少要重设：
+
+- 质量 `m`。
+- 惯量矩阵 `J`。
+- 电机最大转速。
+- 电机推力系数和反扭矩系数。
+- 电机/舵机时间常数。
+- 电机和舵面的安装位置、力臂、符号。
+- 控制增益和 INDI 控制矩阵。
+
+### 11.5 当前 Gazebo 气动模型的限制
+
+当前工程中的 `src/modules/simulation/gz_plugins/phoenix_aero/PhoenixAero.cpp` 是一个简化舵面气动插件，核心模型近似为：
+
+```text
+force = upward * k_lift * omega^2 * delta
+      - forward * k_drag * omega^2 * delta^2
+
+torque = spanwise * k_pitch * omega^2 * delta
+```
+
+这和 Tailsitter-control 的完整气动模型不是一回事。Tailsitter-control 的气动部分考虑了迎角、来流速度、螺旋桨滑流、舵面诱导升力、推力安装角等因素。也就是说：
+
+- 如果只做低速悬停和小范围姿态控制，当前 `PhoenixAero` 插件可以先用于初步验证。
+- 如果要复现 Tailsitter-control 的过渡飞行、前飞、刀锋飞行或差动转弯，需要升级 Gazebo 气动插件。
+- 完整移植时，应把 `/home/zr/Tailsitter-control/environment/aerodynamics.py` 中的 alpha-theory 模型改写到 `PhoenixAero.cpp`，或者重新辨识一套适合当前简化 Gazebo 模型的控制参数。
+
+### 11.6 执行器映射必须重新标定
+
+当前模型有两个电机和两个舵面，但索引和符号不能凭直觉使用。
+
+需要逐项确认：
+
+- `ActuatorMotors.control[0]` 对应哪一个 Gazebo 电机。
+- `ActuatorMotors.control[1]` 对应哪一个 Gazebo 电机。
+- `ActuatorServos.control[0]` 对应左舵面还是右舵面。
+- `ActuatorServos.control[1]` 对应左舵面还是右舵面。
+- 正舵偏到底产生的是正滚转、负滚转、正俯仰还是负俯仰力矩。
+- 电机差动正负号是否和 Tailsitter-control 的分配矩阵一致。
+
+当前 airframe 中舵面参数存在反向映射，例如 `SIM_GZ_SV_MINA1` 大于 `SIM_GZ_SV_MAXA1`，说明归一化指令到实际舵角之间存在符号翻转。必须做单通道测试后再飞闭环。
+
+建议验证顺序：
+
+1. 固定机体或低推力状态下，只给左电机指令，看 Gazebo 中哪个电机转动。
+2. 只给右电机指令，确认索引。
+3. 只给 `servo_0` 正指令，看舵面方向和产生力矩方向。
+4. 只给 `servo_1` 正指令，看舵面方向和产生力矩方向。
+5. 把结果写成明确的控制分配矩阵，避免在控制律里靠临时负号修正。
+
+### 11.7 最小可行移植步骤
+
+建议不要一次性把所有功能移完。比较稳妥的顺序是：
+
+1. 新建独立 ROS 2 节点 `tailsitter_controller.py`，只接管 direct actuator 输出。
+2. 先移植姿态 PD、角速度前馈、角加速度 INDI 和执行器分配。
+3. 使用当前 Gazebo 模型参数重写 `config.py`。
+4. 做电机和舵面单通道映射测试。
+5. 在悬停附近用很保守的增益测试姿态闭环。
+6. 加入位置控制和线加速度 INDI。
+7. 用 `TrajectorySetpoint` 提供 position、velocity、acceleration、jerk、yaw 参考。
+8. 加入执行器实际反馈或更准确的一阶执行器状态估计。
+9. 升级 `PhoenixAero`，使其更接近 Tailsitter-control 的气动模型。
+10. 最后再测试矩形轨迹、圆轨迹、过渡飞行和复杂机动。
+
+### 11.8 需要修改的当前工程文件
+
+较小范围的 ROS 2 移植通常会涉及：
+
+- `ros2_ws/src/phoenix_offboard/phoenix_offboard/`：新增 Tailsitter 控制代码。
+- `ros2_ws/src/phoenix_offboard/setup.py`：注册新的 console script。
+- `ros2_ws/src/phoenix_offboard/package.xml`：补充依赖，例如 `numpy`、`scipy`。
+- `ros2_ws/src/phoenix_offboard/launch/`：新增或修改 launch 文件，启动 Tailsitter 控制器。
+- `src/modules/uxrce_dds_client/dds_topics.yaml`：按需补充加速度、执行器反馈或调试 topic。
+
+完整气动移植还会涉及：
+
+- `src/modules/simulation/gz_plugins/phoenix_aero/PhoenixAero.cpp`
+- `src/modules/simulation/gz_plugins/phoenix_aero/PhoenixAero.hpp`
+- `src/modules/simulation/gz_plugins/phoenix_aero/CMakeLists.txt`
+- `Tools/simulation/gz/models/phoenixdrone/model.sdf`
+
+### 11.9 验证标准
+
+移植完成后至少要验证以下内容：
+
+- ROS 2 节点能稳定收到 PX4 状态 topic。
+- `OffboardControlMode.direct_actuator` 心跳持续发布。
+- PX4 能进入 offboard 并保持 direct actuator 控制。
+- 电机和舵面输出没有 NaN、越界或突变。
+- 姿态静态误差能收敛。
+- 小角度姿态阶跃响应方向正确。
+- 位置小阶跃不会发散。
+- rosbag 中记录的加速度、角加速度、执行器估计值和 INDI 输出相位基本一致。
+- Gazebo 中模型不会因为舵面气动力符号错误而瞬间翻转。
+
+### 11.10 结论
+
+把 Tailsitter-control 用在当前 PX4 仿真平台下，最小版本主要改 ROS 2 控制节点；完整版本还必须改 Gazebo 气动插件。
+
+工程上建议先完成“低速悬停版本”：只移植姿态/角速度/角加速度 INDI 和执行器分配，完成状态、坐标系、执行器映射验证后，再加入位置/线加速度 INDI。等低速闭环可靠以后，再移植完整 alpha-theory 气动模型，用于过渡飞行和前飞等复杂工况。
