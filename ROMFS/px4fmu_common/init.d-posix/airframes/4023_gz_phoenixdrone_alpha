@@ -1,0 +1,17 @@
+#!/bin/sh
+#
+# @name STARS PhoenixDrone Alpha Theory
+#
+# @type VTOL Duo Tailsitter
+#
+
+# Reuse the verified PhoenixDrone actuator and estimator configuration.  The
+# gz target has already selected phoenixdrone_alpha before this file is read.
+. ${R}etc/init.d-posix/airframes/4022_gz_phoenixdrone
+
+# The alpha controller sends direct actuator commands.  Those commands do not
+# populate vehicle_thrust_setpoint, so the multicopter land detector cannot
+# reliably mark takeoff and the normal preflight timer may disarm in the air.
+# Limit this workaround to the alpha SITL airframe.  Use `param set` because a
+# value saved by an earlier test (for example 30 s) overrides `set-default`.
+param set COM_DISARM_PRFLT -1

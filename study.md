@@ -862,3 +862,361 @@ torque = spanwise * k_pitch * omega^2 * delta
 把 Tailsitter-control 用在当前 PX4 仿真平台下，最小版本主要改 ROS 2 控制节点；完整版本还必须改 Gazebo 气动插件。
 
 工程上建议先完成“低速悬停版本”：只移植姿态/角速度/角加速度 INDI 和执行器分配，完成状态、坐标系、执行器映射验证后，再加入位置/线加速度 INDI。等低速闭环可靠以后，再移植完整 alpha-theory 气动模型，用于过渡飞行和前飞等复杂工况。
+
+### 11.11 完全参照 Tailsitter-control 气动模型所需的修改
+
+如果要完整参照 `/home/zr/Tailsitter-control`，不能只替换 `PhoenixAero`。必须同时统一仿真气动力、控制器内部模型、控制分配、执行器动态和参数，否则 INDI 使用的模型会与 Gazebo 中的被控对象不一致。
+
+首先需要区分两种目标：
+
+- 推荐方案是完整移植 Tailsitter-control 的模型结构和公式，但针对当前 PhoenixDrone 重新辨识参数。
+- 完全复现原项目则要求公式和参数全部照搬，包括 `0.7 kg` 质量、`2500 rad/s` 电机、惯量、力臂和舵面范围等。这会使仿真对象不再是当前参数下的 PhoenixDrone。
+
+主要差异和修改范围如下：
+
+| 层级 | 当前实现 | 完整移植需要做的事 |
+|---|---|---|
+| Gazebo 气动 | 两个简化 `PhoenixAero`，只计算滑流舵效 | 改成一个整机 alpha-theory 插件 |
+| 电机推力 | Gazebo `MulticopterMotorModel` 直接施加 | 避免与新气动插件重复计算推力和反扭矩 |
+| 舵机动态 | 舵面角度直接复位到命令 | 加入一阶动态、速率限制和真实状态 |
+| 控制器气动估计 | 简化的 `omega^2 delta` 和 `omega^2 delta^2` | 使用与 Gazebo 完全相同的 alpha-theory 方程 |
+| 控制分配 | 悬停附近固定增益 | 移植速度相关的 Eq.37--40 分配 |
+| 线加速度 INDI | 简化力估计与补偿 | 加入零升力坐标系和 Eq.43 舵面瞬态修正 |
+| 姿态/推力求解 | 简化力向量到姿态映射 | 移植完整 differential-flatness 求解 |
+
+#### 11.11.1 重写 Gazebo 气动插件
+
+当前 `src/modules/simulation/gz_plugins/phoenix_aero/PhoenixAero.cpp` 的模型主要是：
+
+```text
+F_lift  proportional to omega^2 delta
+F_drag  proportional to -omega^2 delta^2
+M_pitch proportional to omega^2 delta
+```
+
+完整插件需要读取：
+
+- 机体真实线速度；
+- 左右电机真实转速；
+- 左右舵面真实角度；
+- 机体姿态；
+- 可选的风速，用于计算空气相对速度。
+
+然后按照 `/home/zr/Tailsitter-control/environment/aerodynamics.py` 实现：
+
+```text
+T_i = c_T omega_i^2
+
+f_T      推力及滑流诱导升阻力
+f_delta  舵面偏转产生的滑流/来流气动力
+f_w      机翼速度相关升阻力
+
+m_T      推力偏心力矩
+m_mu     螺旋桨反扭矩
+m_delta  舵面气动力矩
+
+f_alpha = f_T + f_delta + f_w
+m_body  = m_T + m_mu + m_delta
+```
+
+建议使用一个整机插件实例同时处理两台电机和两个舵面，不能继续使用左右两个完全独立的插件，因为完整模型包含总推力、差动推力及整机力矩耦合。
+
+#### 11.11.2 严格处理四套坐标系
+
+完整模型增加了零升力坐标系 `alpha`，转换链必须明确写成：
+
+```text
+Gazebo FLU
+    -> PX4 FRD
+    -> 绕 PX4 +y 轴旋转 +90 deg
+Tailsitter body
+    -> alpha_0
+零升力坐标系 alpha
+```
+
+控制器内部仍固定使用：
+
+```text
+x_ts = -z_px4
+y_ts =  y_px4
+z_ts =  x_px4
+```
+
+对于 Gazebo 本体系速度，合并后的转换为：
+
+```text
+v_ts = [v_gz.z, -v_gz.y, v_gz.x]
+```
+
+气动力计算完成后，应先计算：
+
+```text
+f_body_ts = R_alpha_to_body * f_alpha
+```
+
+再从 TS 转回 Gazebo 本体系和世界系施加。原模型的 `m_body` 已经包含力臂产生的力矩，因此新插件应在质心施加合力和合力矩，不能再通过当前 `_cp` 产生第二次附加力矩。
+
+#### 11.11.3 消除电机推力的重复计算
+
+这是移植中最容易出错的部分。Tailsitter-control 的 `f_T` 已经包含电机推力，而当前 SDF 中的 `MulticopterMotorModel` 也会施加电机推力和螺旋桨反扭矩。如果两者同时保留，会把推力和反扭矩计算两次。
+
+推荐方案是：
+
+- 保留 `MulticopterMotorModel` 负责命令到转速的一阶动态和旋翼关节显示；
+- 在新的模型变体中关闭它的力和力矩输出；
+- 由新的 alpha-theory 插件根据实际关节转速统一施加全部力和力矩。
+
+因此需要调整模型 SDF 中的：
+
+```xml
+<motorConstant>
+<momentConstant>
+<timeConstantUp>
+<timeConstantDown>
+<maxRotVelocity>
+<rotorVelocitySlowdownSim>
+```
+
+需要先验证 `motorConstant=0` 时关节转速动态是否仍正常。如果当前 Gazebo 电机插件不支持这种方式，就应在新的气动插件中自行实现电机一阶动态。
+
+#### 11.11.4 加入真实舵机动态
+
+Tailsitter-control 中的舵机参数为：
+
+```text
+servo_time_constant = 0.03 s
+servo_rate_max      = 25 rad/s
+```
+
+当前 `PhoenixAero` 会直接把舵面位置复位到命令，没有动态过程。新插件应维护每侧舵面状态：
+
+```text
+delta_dot = (delta_command - delta_actual) / tau_servo
+delta_dot = clip(delta_dot, -servo_rate_max, +servo_rate_max)
+```
+
+气动力计算和关节状态发布都必须使用 `delta_actual`。当前已经建立的 Gazebo 关节实际反馈链路可以继续把真实舵面角和电机转速反馈给控制器。
+
+#### 11.11.5 替换控制器内部气动估计
+
+当前简化估计主要位于：
+
+- `ros2_ws/src/phoenix_tailsitter_control/phoenix_tailsitter_control/position_control.py`
+- `ros2_ws/src/phoenix_tailsitter_control/phoenix_tailsitter_control/allocator.py`
+
+需要新增与 Gazebo C++ 插件逐项一致的 Python 气动模型，输入和输出为：
+
+```text
+输入：v_body_ts, omega_left/right_actual, delta_left/right_actual
+输出：f_alpha, m_body_ts, f_delta_alpha
+```
+
+控制器中的以下简化逻辑需要被替代：
+
+- `estimate_force_components_ts()`；
+- `estimate_moment()`；
+- 当前舵面气动力预补偿；
+- 固定悬停分配矩阵。
+
+控制器还必须根据 NED 速度计算 TS 机体系速度：
+
+```text
+v_body_ts = R_ts_to_ned.T * v_ned
+```
+
+如果加入风场，应使用空气相对速度而不是地速。
+
+#### 11.11.6 移植完整速度相关控制分配
+
+应移植 `/home/zr/Tailsitter-control/controller/actuator_ctrl.py` 中的 Eq.37--40：
+
+1. 根据期望偏航力矩求差动推力。
+2. 在单电机上下限内重新约束总推力和差动推力。
+3. 由 `T_i=c_T omega_i^2` 反算电机转速。
+4. 扣除推力偏心力矩和反扭矩。
+5. 根据当前空速计算左右舵面效率 `nu_1`、`nu_2`。
+6. 使用有界最小二乘求舵面角度。
+
+当前分配器基本不依赖空速，不能直接用于完整前飞模型。
+
+#### 11.11.7 补齐完整 INDI 滤波链
+
+原项目要求下列信号使用相同的 15 Hz 二阶 Butterworth 低通：
+
+- 线加速度；
+- 角速度和角加速度；
+- 电机实际转速；
+- 舵面实际角度；
+- 气动力和力矩估计。
+
+此外还要对舵面信号使用 1 Hz 高通，并实现 Eq.43：
+
+```text
+a_lpf_tilde =
+    a_lpf
+    - (1/m) R_alpha_to_inertial f_delta_hpf
+```
+
+当前控制器尚未实现这条完整的舵面瞬态修正链。
+
+#### 11.11.8 移植完整 differential-flatness 姿态求解
+
+如果目标不仅是气动模型一致，而是完整参照整个 Tailsitter-control 控制框架，还需要用 `/home/zr/Tailsitter-control/controller/att_ctrl.py` 替换当前简化的 `force_to_tailsitter_attitude()`。
+
+完整版本需要使用：
+
+- 期望力；
+- 当前和期望速度；
+- `alpha_0`、`alpha_T`；
+- 舵面合成偏角；
+- jerk；
+- yaw 和 yawspeed；
+- 角速度前馈。
+
+否则即使 Gazebo 气动力完全移植，过渡飞行中的期望姿态仍不等价。
+
+#### 11.11.9 参数选择
+
+Tailsitter-control 当前配置中的主要参数为：
+
+```text
+mass       = 0.7 kg
+J          = diag(0.0095, 0.0030, 0.0115)
+c_T        = 1.8e-6
+omega_max  = 2500 rad/s
+l_Ty       = 0.15 m
+l_dy       = 0.12 m
+l_dx       = 0.075 m
+alpha_0    = -2 deg
+alpha_T    = -5 deg
+delta_max  = 1 rad
+```
+
+当前 PhoenixDrone 则大致为：
+
+```text
+mass       = 0.525 kg
+omega_max  = 800 rad/s
+c_T        = 7.864e-6
+motor arm  = 0.195 m
+```
+
+如果直接照搬原参数，必须同步修改质量、惯量、几何、电机和舵面限制，否则同一个仿真中会存在相互矛盾的飞机参数。
+
+更合理的方案是保留完整公式，但针对当前模型重新辨识：
+
+```text
+alpha_0, alpha_T
+c_T, c_mu, c_mu_T
+c_LV, c_DV
+c_LT, c_DT
+c_LV_delta, c_LT_delta
+l_Ty, l_dy, l_dx
+```
+
+#### 11.11.10 在不修改现有代码约束下的推荐实现
+
+为了保留当前已经验证过的简化模型，不应直接覆盖 `PhoenixAero` 和 `phoenixdrone`，而应并行新增：
+
+```text
+src/modules/simulation/gz_plugins/tailsitter_alpha_aero/
+Tools/simulation/gz/models/phoenixdrone_alpha/
+ros2_ws/src/phoenix_tailsitter_control/phoenix_tailsitter_control/alpha_aerodynamics.py
+ros2_ws/src/phoenix_tailsitter_control/phoenix_tailsitter_control/alpha_allocator.py
+ros2_ws/src/phoenix_tailsitter_control/launch/tailsitter_alpha_sitl.launch.py
+```
+
+这样可以在两套模型之间进行 A/B 对比：
+
+```text
+phoenixdrone       = 当前简化模型
+phoenixdrone_alpha = 完整 alpha-theory 模型
+```
+
+构建系统仍需注册新的插件目标，但原气动实现和原模型内容可以保持不变。
+
+#### 11.11.11 验证顺序
+
+正式测试过渡轨迹前，至少需要完成：
+
+1. 让 C++ 插件与原 Python 气动模型在随机状态网格上的力和力矩逐项一致。
+2. 使用单位基向量测试锁定 GZ、PX4、TS 和 alpha 四套坐标转换。
+3. 确认电机推力和反扭矩没有重复施加。
+4. 验证悬停配平、电机差动和两舵面正负方向。
+5. 验证前飞速度变化时舵效随 `|v| v_x_alpha` 正确变化。
+6. 按悬停、小前飞、直线加速、过渡和圆轨迹逐级测试。
+7. 最后才测试 knife-edge、差动转弯等复杂机动。
+
+需要注意，当前 Tailsitter-control 仓库中的“完整模型”仍然是论文 alpha-theory 的低阶模型。源码注释已经说明 `alpha_0`、部分几何和电机参数属于估算值；它不是包含失速、动态失速、翼尖涡和 CFD 数据的全包线高保真模型。
+
+#### 11.11.12 推荐方案的实现状态（2026-08-27）
+
+已按 11.11.10 的并行方案完成第一版实现，保留现有 `PhoenixAero`、`phoenixdrone` 和低速控制入口不变。新增内容为：
+
+```text
+TailsitterAlphaAero                整机 Gazebo alpha-theory 插件
+phoenixdrone_alpha                 独立模型，禁止电机插件重复施力
+4023_gz_phoenixdrone_alpha        独立 PX4 SITL airframe
+alpha_aerodynamics.py             Eq.5--14 控制器同构模型
+alpha_allocator.py                Eq.37--40 速度相关分配
+flatness_control.py               Eq.17--35 平坦性姿态和角速度前馈
+alpha_controller_node.py          Eq.43、Eq.46 及完整滤波链
+tailsitter_alpha_sitl.launch.py   独立启动入口
+```
+
+坐标链在插件和测试中固定为：
+
+```text
+[x_ts, y_ts, z_ts] = [z_gz, -y_gz, x_gz]
+x_ts = -z_px4, y_ts = y_px4, z_ts = x_px4
+```
+
+当前需要重辨识或测量复核的参数及默认值为：
+
+| 类别 | 参数 | 默认值 |
+|---|---|---:|
+| 质量/推进 | `mass`, `c_T`, `c_mu`, `c_mu_T` | `0.525`, `7.864e-6`, `1.80872e-7`, `0` |
+| 气动角 | `alpha_0`, `alpha_T` | `-2 deg`, `0 deg` |
+| 速度气动 | `c_LV`, `c_DV` | `0.29`, `0` |
+| 滑流气动 | `c_LT`, `c_DT` | `2.23`, `0` |
+| 舵效 | `c_LV_delta`, `c_LT_delta` | `0.18`, `1.25` |
+| 几何 | `l_Ty`, `l_dy`, `l_dx` | `0.195`, `0.195`, `0.036 m` |
+| 电机动态 | `tau_up`, `tau_down` | `0.016`, `0.020 s` |
+| 舵机动态 | `tau_servo`, `servo_rate_max` | `0.03 s`, `25 rad/s` |
+
+控制端默认值集中在 `PhoenixHoverConfig.alpha_identification_defaults`；仿真端对应值集中在 `phoenixdrone_alpha/model.sdf` 的 `TailsitterAlphaAero` 插件块。辨识时两处必须成对更新。当前 `c_T`、`c_mu`、质量和几何来自 PhoenixDrone 现有模型，其余气动系数主要采用 Tailsitter-control 的起始值，均不能视为当前 PhoenixDrone 的实测结果。
+
+首轮验证结果：PX4/Gazebo 插件和 ROS 2 包构建通过；colcon 汇总为 `47 tests, 0 errors, 0 failures`；alpha 机型以 `SYS_AUTOSTART=4023` 正常启动；零输出门控、实际关节反馈和 250 Hz 模型调试话题正常；短时解锁地面测试没有发生快速翻转。该结果只确认结构、公式、坐标链和执行器链路可运行，下一阶段仍须按 11.11.11 的顺序完成气动参数辨识和各飞行包线验收。
+
+#### 11.11.13 当前能否完成起飞、前飞和降落
+
+目前还不能认为该机型能够可靠完成“垂直起飞 -> 姿态过渡 -> 前飞 -> 反向过渡 -> 降落”的完整自动任务。
+
+完整移植解决的是 Gazebo 被控对象、控制器内部模型、控制分配、滤波链和平坦性公式的一致性，但当前实际验证只覆盖：
+
+- alpha 模型和控制器可以正常启动；
+- 执行器反馈、通道映射和坐标转换方向正确；
+- 短时解锁没有发生由符号错误导致的快速翻转；
+- 尚未完成自由飞行悬停、前飞配平、完整过渡和自动降落验收。
+
+当前仍存在以下关键缺口：
+
+1. `c_LV`、`c_LT`、`c_LT_delta`、`alpha_0` 等参数仍是辨识起始值，没有针对 PhoenixDrone 完成重新辨识。
+2. 尚未验证垂直起飞后的高度闭环、悬停稳态误差和抗扰能力。
+3. 尚未获得不同空速下的前飞配平姿态、总推力和左右舵偏。
+4. 当前没有完整的起飞、过渡、巡航、反向过渡和降落任务状态机。
+5. 降落阶段的接地检测、下降速度约束、推力收尾和异常中止逻辑尚未接入。
+6. Tailsitter-control 使用的是低阶 alpha-theory 模型，不包含失速、动态失速等复杂效应，过渡区结果必须通过分阶段仿真重新验证。
+
+从软件结构上看，`alpha_controller_node.py` 已经能够接收包含 position、velocity、acceleration、jerk、yaw 和 yawspeed 的连续 `TrajectorySetpoint`，因此具备实现完整任务的控制基础。但当前直接输入大幅前飞轨迹，仍可能产生推力饱和、舵面饱和、错误配平或失稳，不能作为安全测试入口。
+
+推荐按以下顺序继续：
+
+1. 完成垂直起飞至 `0.3--0.5 m`，验证高度闭环和稳定悬停。
+2. 分别寻找 `0.5、1、2、4 m/s` 下的定速前飞配平点。
+3. 从小于 `5 deg` 的姿态变化开始验证渐进式过渡。
+4. 完成完整约 `90 deg` 前飞过渡以及反向过渡。
+5. 加入带超时、限幅和异常中止的任务轨迹与落地状态机。
+6. 最后执行短距离自动起飞、前飞和降落测试。
+
+因此，当前结论是：完整任务所需的气动和控制框架已经具备，但系统仍处于参数辨识和分阶段飞行验证阶段，不能表述为已经能够可靠自动完成起飞、前飞和降落。
