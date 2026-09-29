@@ -15,3 +15,26 @@
 # Limit this workaround to the alpha SITL airframe.  Use `param set` because a
 # value saved by an earlier test (for example 30 s) overrides `set-default`.
 param set COM_DISARM_PRFLT -1
+
+# Keep repeated SITL runs deterministic.  EKF bias estimates from aggressive
+# flights are otherwise committed on disarm and reused by the next simulation.
+param set SENS_IMU_AUTOCAL 0
+param set CAL_ACC0_XOFF 0
+param set CAL_ACC0_YOFF 0
+param set CAL_ACC0_ZOFF 0
+param set CAL_GYRO0_XOFF 0
+param set CAL_GYRO0_YOFF 0
+param set CAL_GYRO0_ZOFF 0
+
+# Match direct alpha-controller normalization to the reference actuators.
+# Both the motor joints and TailsitterAlphaAero consume rad/s directly so the
+# joint feedback is the same state used to apply the aerodynamic wrench.
+param set SIM_GZ_EC_MAX1 2500
+param set SIM_GZ_EC_MAX2 2500
+
+# GZMixingInterfaceServo publishes physical radians and the channel direction
+# is inverted.  +/-57.2958 deg maps normalized commands to +/-1 rad.
+param set SIM_GZ_SV_MINA1 57.2957795
+param set SIM_GZ_SV_MAXA1 -57.2957795
+param set SIM_GZ_SV_MINA2 57.2957795
+param set SIM_GZ_SV_MAXA2 -57.2957795

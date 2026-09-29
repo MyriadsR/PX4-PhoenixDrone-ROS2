@@ -9,21 +9,22 @@ from .frames import inertia_px4_to_ts
 
 @dataclass(frozen=True)
 class PhoenixHoverConfig:
-    # SDF masses: base 0.5 kg, IMU 0.015 kg, two 0.005 kg rotors.
-    mass: float = 0.525
+    # Match the Tailsitter-control reference configuration.
+    mass: float = 0.7
     gravity: float = 9.81
 
-    # Current controller/SDF values expressed about the PX4 FRD axes.
+    # Tailsitter-control uses TS inertia diag([0.0095, 0.0030, 0.0115]).
+    # Express it about PX4 FRD axes using x_ts=-z_px4, y_ts=y_px4, z_ts=x_px4.
     inertia_px4: np.ndarray = field(default_factory=lambda: np.diag([
-        0.0144, 0.00638929, 0.0176,
+        0.0115, 0.0030, 0.0095,
     ]))
 
-    motor_thrust_coefficient: float = 7.864e-6
-    motor_moment_ratio: float = 0.023
-    motor_arm_y: float = 0.195
-    motor_speed_max: float = 800.0
-    motor_time_constant_up: float = 0.016
-    motor_time_constant_down: float = 0.020
+    motor_thrust_coefficient: float = 1.8e-6
+    motor_moment_ratio: float = 2.2e-8 / 1.8e-6
+    motor_arm_y: float = 0.15
+    motor_speed_max: float = 2500.0
+    motor_time_constant_up: float = 0.04
+    motor_time_constant_down: float = 0.04
     rotor_velocity_slowdown: float = 10.0
     actuator_feedback_timeout_s: float = 0.05
 
@@ -34,8 +35,8 @@ class PhoenixHoverConfig:
     # PhoenixAero cp.z_GZ=+0.036 becomes x_ts=+0.036 after FLU->FRD and
     # PX4->Tailsitter conversion.
     flap_cp_x_ts: float = 0.036
-    left_flap_limit: float = float(np.deg2rad(60.0))
-    right_flap_limit: float = float(np.deg2rad(30.0))
+    left_flap_limit: float = 1.0
+    right_flap_limit: float = 1.0
 
     # Full alpha-theory model (study.md 11.11).  Geometry and propulsion
     # defaults come from the current PhoenixDrone SDF.  Entries explicitly
@@ -43,63 +44,74 @@ class PhoenixHoverConfig:
     # as conservative starting points; they are not claimed measurements for
     # PhoenixDrone.
     alpha_zero_lift_rad: float = float(np.deg2rad(-2.0))  # IDENTIFY
-    alpha_thrust_installation_rad: float = 0.0
+    alpha_thrust_installation_rad: float = float(np.deg2rad(-5.0))
     alpha_c_lv: float = 0.29  # IDENTIFY
     alpha_c_dv: float = 0.0  # IDENTIFY
     alpha_c_lt: float = 2.23  # IDENTIFY
     alpha_c_dt: float = 0.0  # IDENTIFY
     alpha_c_lv_delta: float = 0.18  # IDENTIFY
     alpha_c_lt_delta: float = 1.25  # IDENTIFY
-    alpha_c_mu_t: float = 0.0  # IDENTIFY
-    alpha_motor_torque_coefficient: float = 1.80872e-7
-    alpha_motor_arm_y: float = 0.195
-    alpha_flap_arm_y: float = 0.195
-    alpha_flap_arm_x: float = 0.036
+    alpha_c_mu_t: float = -0.025
+    alpha_motor_torque_coefficient: float = 2.2e-8
+    alpha_motor_arm_y: float = 0.15
+    alpha_flap_arm_y: float = 0.12
+    alpha_flap_arm_x: float = 0.075
     servo_time_constant: float = 0.03  # IDENTIFY
     servo_rate_limit_rad_s: float = 25.0  # IDENTIFY
     flap_hpf_cutoff_hz: float = 1.0
 
-    control_rate_hz: float = 250.0
+    control_rate_hz: float = 500.0
     indi_lpf_cutoff_hz: float = 15.0
     linear_indi_lpf_cutoff_hz: float = 5.0
     state_timeout_s: float = 0.10
     control_mode_timeout_s: float = 0.50
     setpoint_timeout_s: float = 0.50
 
-    # Conservative hover-only gains in Tailsitter-control body axes.
-    # The 2026-08-26 airborne MCAP identification found about 20/30/60 ms
-    # plant delay on x/y/z.  The y plant is stronger than the static model,
-    # while the differential-thrust z plant is much weaker.  These limits are
-    # intentionally sized for the first +/-0.05 rad validation campaign.
+    # PX4/Gazebo inner-loop gains in TS body axes.  The much larger gains from
+    # the ideal continuous-time reference model saturate the simulated
+    # actuator chain during the ground-to-flight transient.
     attitude_gain: np.ndarray = field(default_factory=lambda: np.array([6.0, 6.0, 6.0]))
     rate_gain: np.ndarray = field(default_factory=lambda: np.array([3.0, 3.0, 3.0]))
     angular_acceleration_limit: np.ndarray = field(
-        default_factory=lambda: np.array([10.0, 6.0, 12.0]))
-    moment_limit: np.ndarray = field(default_factory=lambda: np.array([0.04, 0.012, 0.08]))
+        default_factory=lambda: np.array([20.0, 15.0, 24.0]))
+    moment_limit: np.ndarray = field(default_factory=lambda: np.array([0.25, 0.08, 0.35]))
 
-    # Hover-only position/linear-acceleration loop.  Gains are expressed in
-    # TS body axes and rotated into NED each cycle, matching the source
-    # Tailsitter-control position law.  Limits deliberately constrain the
-    # first validation campaign to small position steps.
+    # Tailsitter-control position/linear-acceleration loop in TS body axes.
+    # Keep the vertical TS-x gains, but damp both horizontal body axes.  The
+    # reference gains produced a large, slow limit cycle during staging once
+    # horizontal acceleration reached its bound.
     position_gain: np.ndarray = field(
-        default_factory=lambda: np.array([2.5, 0.10, 0.10]))
+        default_factory=lambda: np.array([4.0, 1.0, 1.5]))
     velocity_gain: np.ndarray = field(
-        default_factory=lambda: np.array([1.8, 0.80, 0.80]))
+        default_factory=lambda: np.array([3.0, 3.0, 3.0]))
+    # Finite acceleration feed-forward identifies maneuvering references.  Use
+    # more velocity damping there without changing the proven takeoff/landing
+    # gains used by position-only staging setpoints.
+    tracking_position_gain: np.ndarray = field(
+        default_factory=lambda: np.array([2.0, 1.5, 2.25]))
+    tracking_velocity_gain: np.ndarray = field(
+        default_factory=lambda: np.array([4.0, 3.0, 3.0]))
     linear_acceleration_gain: np.ndarray = field(
         default_factory=lambda: np.zeros(3))
-    position_error_limit: float = 0.40
-    velocity_error_limit: float = 0.80
-    # Horizontal force changes are delayed by the attitude loop.  The first
-    # airborne identification measured roughly 0.44 s effective horizontal
-    # response.  These second-stage limits are still conservative, but allow
-    # visible attitude motion while tuning the position loop from step tests.
+    position_error_limit: float = float('inf')
+    velocity_error_limit: float = float('inf')
     linear_indi_blend: float = 1.0
+    # Limit only position/velocity feedback.  Trajectory acceleration
+    # feed-forward bypasses these limits so aggressive reference motion is
+    # preserved while takeoff disturbances remain bounded.
     horizontal_acceleration_limit: float = 0.45
     vertical_acceleration_limit: float = 0.80
-    position_tilt_limit_rad: float = float(np.deg2rad(5.0))
-    horizontal_force_slew_rate_n_s: float = 0.18
-    minimum_position_thrust_scale: float = 0.85
-    maximum_position_thrust_scale: float = 1.20
+    # Gazebo cannot tolerate the ideal model's unbounded Eq. 41 feedback.  Keep
+    # staging conservative and use the stable maneuver envelope identified in
+    # closed-loop SITL testing.
+    tracking_horizontal_acceleration_limit: float = 2.00
+    tracking_vertical_acceleration_limit: float = 1.50
+    position_tilt_limit_rad: float = float(np.deg2rad(89.0))
+    horizontal_force_slew_rate_n_s: float = 1.0e6
+    minimum_position_thrust_scale: float = 0.0
+    maximum_position_thrust_scale: float = float('inf')
+    takeoff_force_floor_trigger_scale: float = 0.8
+    takeoff_force_floor_max_scale: float = 2.0
 
     @property
     def inertia_ts(self):

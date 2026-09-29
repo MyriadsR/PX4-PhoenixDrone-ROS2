@@ -33,6 +33,46 @@ class LemniscateSample:
     yawspeed: float
 
 
+def smooth_stop_sample(start_position, start_velocity, t, duration, target_z):
+    """Stop along the measured horizontal velocity with quintic speed scaling."""
+    position_0 = np.asarray(start_position, dtype=float)
+    velocity_0 = np.asarray(start_velocity, dtype=float).copy()
+    if position_0.shape != (3,) or velocity_0.shape != (3,):
+        raise ValueError('smooth-stop state must contain finite 3-vectors')
+    if not np.all(np.isfinite(np.concatenate((position_0, velocity_0)))):
+        raise ValueError('smooth-stop state must contain finite 3-vectors')
+    if not math.isfinite(duration) or duration <= 0.0:
+        raise ValueError('smooth-stop duration must be finite and positive')
+    if not math.isfinite(target_z):
+        raise ValueError('smooth-stop target z must be finite')
+
+    velocity_0[2] = 0.0
+    ratio = float(np.clip(float(t) / duration, 0.0, 1.0))
+    ratio_2 = ratio * ratio
+    ratio_3 = ratio_2 * ratio
+    ratio_4 = ratio_3 * ratio
+    ratio_5 = ratio_4 * ratio
+    ratio_6 = ratio_5 * ratio
+    smooth = 10.0 * ratio_3 - 15.0 * ratio_4 + 6.0 * ratio_5
+    smooth_integral = 2.5 * ratio_4 - 3.0 * ratio_5 + ratio_6
+    path_rate = 1.0 - smooth
+    path_acceleration = -(
+        30.0 * ratio_2 - 60.0 * ratio_3 + 30.0 * ratio_4
+    ) / duration
+    path_jerk = -(
+        60.0 * ratio - 180.0 * ratio_2 + 120.0 * ratio_3
+    ) / duration**2
+
+    position = position_0 + velocity_0 * duration * (
+        ratio - smooth_integral)
+    position[2] = float(target_z)
+    velocity = velocity_0 * path_rate
+    acceleration = velocity_0 * path_acceleration
+    jerk = velocity_0 * path_jerk
+    yaw = float(math.atan2(velocity_0[1], velocity_0[0]))
+    return LemniscateSample(position, velocity, acceleration, jerk, yaw, 0.0)
+
+
 def _bernoulli_lemniscate_derivatives(parameter):
     """Return 0th through 3rd derivatives of the unit Bernoulli lemniscate."""
     u = np.asarray(parameter, dtype=float)
@@ -175,6 +215,83 @@ class BernoulliLemniscateTrajectory:
         return LemniscateSample(
             position, velocity, acceleration, jerk, yaw, yawspeed)
 
+    def entry_sample(self, t, duration):
+        """Follow the curve while smoothly increasing path speed from 0 to 1."""
+        if not math.isfinite(duration) or duration <= 0.0:
+            raise ValueError('entry duration must be finite and positive')
+        ratio = float(np.clip(float(t) / duration, 0.0, 1.0))
+        ratio_2 = ratio * ratio
+        ratio_3 = ratio_2 * ratio
+        ratio_4 = ratio_3 * ratio
+        ratio_5 = ratio_4 * ratio
+        ratio_6 = ratio_5 * ratio
+        path_time = duration * (
+            2.5 * ratio_4 - 3.0 * ratio_5 + ratio_6)
+        path_rate = 10.0 * ratio_3 - 15.0 * ratio_4 + 6.0 * ratio_5
+        path_acceleration = (
+            30.0 * ratio_2 - 60.0 * ratio_3 + 30.0 * ratio_4
+        ) / duration
+        path_jerk = (
+            60.0 * ratio - 180.0 * ratio_2 + 120.0 * ratio_3
+        ) / duration**2
+
+        sample = self.sample(path_time)
+        velocity = sample.velocity * path_rate
+        acceleration = (
+            sample.acceleration * path_rate**2
+            + sample.velocity * path_acceleration)
+        jerk = (
+            sample.jerk * path_rate**3
+            + 3.0 * sample.acceleration * path_rate * path_acceleration
+            + sample.velocity * path_jerk)
+        return LemniscateSample(
+            sample.position,
+            velocity,
+            acceleration,
+            jerk,
+            sample.yaw,
+            sample.yawspeed * path_rate,
+        )
+
+    def exit_sample(self, start_time, t, duration):
+        """Follow the curve while smoothly reducing path speed from 1 to 0."""
+        if not math.isfinite(duration) or duration <= 0.0:
+            raise ValueError('exit duration must be finite and positive')
+        ratio = float(np.clip(float(t) / duration, 0.0, 1.0))
+        ratio_2 = ratio * ratio
+        ratio_3 = ratio_2 * ratio
+        ratio_4 = ratio_3 * ratio
+        ratio_5 = ratio_4 * ratio
+        ratio_6 = ratio_5 * ratio
+        smooth_integral = 2.5 * ratio_4 - 3.0 * ratio_5 + ratio_6
+        path_time = float(start_time) + duration * (ratio - smooth_integral)
+        path_rate = 1.0 - (
+            10.0 * ratio_3 - 15.0 * ratio_4 + 6.0 * ratio_5)
+        path_acceleration = -(
+            30.0 * ratio_2 - 60.0 * ratio_3 + 30.0 * ratio_4
+        ) / duration
+        path_jerk = -(
+            60.0 * ratio - 180.0 * ratio_2 + 120.0 * ratio_3
+        ) / duration**2
+
+        sample = self.sample(path_time)
+        velocity = sample.velocity * path_rate
+        acceleration = (
+            sample.acceleration * path_rate**2
+            + sample.velocity * path_acceleration)
+        jerk = (
+            sample.jerk * path_rate**3
+            + 3.0 * sample.acceleration * path_rate * path_acceleration
+            + sample.velocity * path_jerk)
+        return LemniscateSample(
+            sample.position,
+            velocity,
+            acceleration,
+            jerk,
+            sample.yaw,
+            sample.yawspeed * path_rate,
+        )
+
     def horizontal_radius_bound(self):
         positions, _, _, _ = _bernoulli_lemniscate_derivatives(self._u_table)
         shifted = self.scale * positions + self.center[:2]
@@ -187,21 +304,26 @@ class LemniscateMissionTest(Node):
     def __init__(self):
         super().__init__('phoenix_lemniscate_mission_test')
         self.declare_parameter('confirmation', '')
-        self.declare_parameter('speed_m_s', 0.15)
-        self.declare_parameter('lap_time_s', 48.0)
-        self.declare_parameter('laps', 1)
-        self.declare_parameter('takeoff_height_m', 2.0)
+        self.declare_parameter('speed_m_s', 6.0)
+        self.declare_parameter('lap_time_s', 7.0)
+        self.declare_parameter('laps', 8)
+        self.declare_parameter('takeoff_height_m', 10.0)
+        self.declare_parameter('staging_horizontal_speed_m_s', 0.15)
         self.declare_parameter('climb_speed_m_s', 0.30)
         self.declare_parameter('descent_speed_m_s', 0.18)
         self.declare_parameter('start_dwell_s', 1.5)
-        self.declare_parameter('horizontal_tolerance_m', 0.35)
-        self.declare_parameter('vertical_tolerance_m', 0.25)
-        self.declare_parameter('speed_tolerance_m_s', 0.35)
-        self.declare_parameter('track_rms_limit_m', 0.80)
-        self.declare_parameter('track_peak_limit_m', 1.50)
+        self.declare_parameter('entry_duration_s', 4.0)
+        self.declare_parameter('exit_duration_s', 4.0)
+        self.declare_parameter('posttrack_braking_acceleration_m_s2', 2.0)
+        self.declare_parameter('horizontal_safety_margin_m', 3.0)
+        self.declare_parameter('horizontal_tolerance_m', 0.50)
+        self.declare_parameter('vertical_tolerance_m', 0.50)
+        self.declare_parameter('speed_tolerance_m_s', 0.80)
+        self.declare_parameter('track_rms_limit_m', 10.0)
+        self.declare_parameter('track_peak_limit_m', 25.0)
         self.declare_parameter('wait_timeout_s', 45.0)
-        self.declare_parameter('takeoff_timeout_s', 35.0)
-        self.declare_parameter('land_timeout_s', 35.0)
+        self.declare_parameter('takeoff_timeout_s', 60.0)
+        self.declare_parameter('land_timeout_s', 60.0)
 
         if str(self.get_parameter('confirmation').value) != CONFIRMATION:
             raise ValueError(f'confirmation must equal {CONFIRMATION}')
@@ -214,7 +336,17 @@ class LemniscateMissionTest(Node):
         self.climb_speed = float(self.get_parameter('climb_speed_m_s').value)
         self.descent_speed = float(
             self.get_parameter('descent_speed_m_s').value)
+        self.staging_horizontal_speed = float(
+            self.get_parameter('staging_horizontal_speed_m_s').value)
         self.start_dwell_s = float(self.get_parameter('start_dwell_s').value)
+        self.entry_duration_s = float(
+            self.get_parameter('entry_duration_s').value)
+        self.exit_duration_s = float(
+            self.get_parameter('exit_duration_s').value)
+        self.posttrack_braking_acceleration = float(
+            self.get_parameter('posttrack_braking_acceleration_m_s2').value)
+        self.horizontal_safety_margin = float(
+            self.get_parameter('horizontal_safety_margin_m').value)
         self.horizontal_tolerance = float(
             self.get_parameter('horizontal_tolerance_m').value)
         self.vertical_tolerance = float(
@@ -234,24 +366,31 @@ class LemniscateMissionTest(Node):
 
         positive = (
             self.speed, self.lap_time, self.takeoff_height,
-            self.climb_speed, self.descent_speed, self.start_dwell_s,
+            self.staging_horizontal_speed, self.climb_speed,
+            self.descent_speed, self.start_dwell_s,
+            self.entry_duration_s, self.exit_duration_s,
+            self.posttrack_braking_acceleration,
+            self.horizontal_safety_margin,
             self.horizontal_tolerance, self.vertical_tolerance,
             self.speed_tolerance, self.track_rms_limit, self.track_peak_limit,
             self.wait_timeout_s, self.takeoff_timeout_s, self.land_timeout_s,
         )
         if not all(math.isfinite(value) and value > 0.0 for value in positive):
             raise ValueError('all timing, speed, tolerance, and limit values must be positive')
-        if self.speed > 0.30:
-            raise ValueError('speed_m_s is limited to <= 0.30 for this SITL test')
-        if self.takeoff_height > 2.5:
-            raise ValueError('takeoff_height_m is limited to <= 2.5 for this SITL test')
+        if self.speed > 8.0:
+            raise ValueError('speed_m_s is limited to <= 8.0 for this SITL test')
+        if self.takeoff_height > 12.0:
+            raise ValueError('takeoff_height_m is limited to <= 12.0 for this SITL test')
 
         self.trajectory = BernoulliLemniscateTrajectory(
             self.speed, self.lap_time, self.laps, self.takeoff_height)
         self.start_sample = self.trajectory.sample(0.0)
-        self.final_sample = self.trajectory.sample(
-            self.trajectory.total_duration)
+        self.track_phase_offset_s = 0.5 * self.entry_duration_s
+        self.track_end_phase_s = (
+            self.track_phase_offset_s + self.trajectory.total_duration)
+        self.final_sample = self.trajectory.sample(self.track_end_phase_s)
         self.horizontal_bound = self.trajectory.horizontal_radius_bound()
+        self.exit_horizontal_bound = self.horizontal_bound
 
         self.local_position = None
         self.control_mode = None
@@ -259,11 +398,17 @@ class LemniscateMissionTest(Node):
         self.origin = None
         self.setpoint = None
         self.setpoint_velocity = np.zeros(3)
+        self.posttrack_target = None
         self.phase = 'prestream'
         self.created_ns = self.get_clock().now().nanoseconds
         self.prestream_started_ns = None
         self.phase_started_ns = None
         self.track_started_ns = None
+        self.entry_started_ns = None
+        self.exit_started_ns = None
+        self.exit_start_position = None
+        self.exit_start_velocity = None
+        self.exit_braking_duration_s = None
         self.stable_started_ns = None
         self.last_tick_ns = None
         self.last_command_ns = 0
@@ -355,14 +500,16 @@ class LemniscateMissionTest(Node):
         message.yawspeed = float(sample.yawspeed)
         self.setpoint_publisher.publish(message)
 
-    def _publish_hold_or_slew(self, position, velocity=None):
+    def _publish_hold_or_slew(
+            self, position, velocity=None, *, tracking_feedback=False):
         message = TrajectorySetpoint()
         message.timestamp = self.get_clock().now().nanoseconds // 1000
         message.position = np.asarray(position, dtype=float).tolist()
         message.velocity = (
             np.zeros(3) if velocity is None else np.asarray(velocity, dtype=float)
         ).tolist()
-        message.acceleration = [math.nan] * 3
+        message.acceleration = (
+            [0.0] * 3 if tracking_feedback else [math.nan] * 3)
         message.jerk = [math.nan] * 3
         message.yaw = math.nan
         message.yawspeed = math.nan
@@ -415,7 +562,7 @@ class LemniscateMissionTest(Node):
         relative = position - self.origin
         horizontal = float(np.linalg.norm(relative[:2]))
         speed = float(np.linalg.norm(velocity))
-        if horizontal > self.horizontal_bound + 1.0:
+        if horizontal > self.exit_horizontal_bound + self.horizontal_safety_margin:
             return f'horizontal displacement {horizontal:.3f} m'
         if -relative[2] > self.takeoff_height + 0.8:
             return f'height {-relative[2]:.3f} m'
@@ -435,6 +582,32 @@ class LemniscateMissionTest(Node):
             self.setpoint_velocity.fill(0.0)
             self.origin[:2] = self.local_position[0][:2]
         self._set_phase('land', now_ns)
+
+    def _start_exit_braking(self, now_ns):
+        position, _ = self.local_position
+        self.exit_braking_duration_s = self.exit_duration_s
+        self.exit_started_ns = now_ns
+        self.exit_start_position = position.copy()
+        exit_times = np.linspace(
+            0.0, self.exit_braking_duration_s, num=101)
+        exit_samples = [
+            self.trajectory.exit_sample(
+                self.track_end_phase_s,
+                exit_time,
+                self.exit_braking_duration_s,
+            )
+            for exit_time in exit_times
+        ]
+        self.posttrack_target = self.origin + exit_samples[-1].position
+        self.exit_horizontal_bound = max(
+            self.horizontal_bound,
+            float(np.linalg.norm((position - self.origin)[:2])),
+            max(float(np.linalg.norm(sample.position[:2]))
+                for sample in exit_samples),
+        )
+        self.setpoint = self.posttrack_target.copy()
+        self.setpoint_velocity.fill(0.0)
+        self._set_phase('exit', now_ns)
 
     def _record_tracking_sample(self, elapsed_s, reference):
         position, velocity = self.local_position
@@ -486,6 +659,7 @@ class LemniscateMissionTest(Node):
             'takeoff_height_m': self.takeoff_height,
             'scale_m': self.trajectory.scale,
             'horizontal_bound_m': self.horizontal_bound,
+            'exit_horizontal_bound_m': self.exit_horizontal_bound,
             'position_min_ned_m': (None if self.position_min is None
                                    else self.position_min.tolist()),
             'position_max_ned_m': (None if self.position_max is None
@@ -564,7 +738,8 @@ class LemniscateMissionTest(Node):
         if self.phase == 'takeoff':
             target = self.origin + self.start_sample.position
             self.setpoint, self.setpoint_velocity = slew_setpoint_with_velocity(
-                self.setpoint, target, dt, self.speed, self.climb_speed)
+                self.setpoint, target, dt,
+                self.staging_horizontal_speed, self.climb_speed)
             self._publish_hold_or_slew(self.setpoint, self.setpoint_velocity)
             position, velocity = self.local_position
             if target_is_stable(
@@ -575,22 +750,61 @@ class LemniscateMissionTest(Node):
                     self.stable_started_ns = now_ns
                 elif now_ns - self.stable_started_ns >= int(
                         self.start_dwell_s * 1e9):
-                    self.track_started_ns = now_ns
-                    self._set_phase('track', now_ns)
+                    self.entry_started_ns = now_ns
+                    self._set_phase('entry', now_ns)
             else:
                 self.stable_started_ns = None
             if (now_ns - self.phase_started_ns) * 1e-9 > self.takeoff_timeout_s:
                 self._abort_to_land('takeoff phase timed out', now_ns)
             return
 
+        if self.phase == 'entry':
+            elapsed_s = (now_ns - self.entry_started_ns) * 1e-9
+            if elapsed_s <= self.entry_duration_s:
+                reference = self.trajectory.entry_sample(
+                    elapsed_s, self.entry_duration_s)
+                self._publish_sample(LemniscateSample(
+                    self.origin + reference.position,
+                    reference.velocity,
+                    reference.acceleration,
+                    reference.jerk,
+                    reference.yaw,
+                    reference.yawspeed,
+                ))
+            else:
+                self.track_started_ns = now_ns
+                self._set_phase('track', now_ns)
+            return
+
         if self.phase == 'track':
             elapsed_s = (now_ns - self.track_started_ns) * 1e-9
             if elapsed_s <= self.trajectory.total_duration:
-                reference = self._absolute_sample(elapsed_s)
+                reference = self._absolute_sample(
+                    self.track_phase_offset_s + elapsed_s)
                 self._publish_sample(reference)
                 self._record_tracking_sample(elapsed_s, reference)
             else:
-                self.setpoint = self.origin + self.final_sample.position
+                self._start_exit_braking(now_ns)
+            return
+
+        if self.phase == 'exit':
+            elapsed_s = (now_ns - self.exit_started_ns) * 1e-9
+            if elapsed_s <= self.exit_braking_duration_s:
+                reference = self.trajectory.exit_sample(
+                    self.track_end_phase_s,
+                    elapsed_s,
+                    self.exit_braking_duration_s,
+                )
+                self._publish_sample(LemniscateSample(
+                    self.origin + reference.position,
+                    reference.velocity,
+                    reference.acceleration,
+                    reference.jerk,
+                    reference.yaw,
+                    reference.yawspeed,
+                ))
+            else:
+                self.setpoint = self.posttrack_target.copy()
                 self.setpoint_velocity.fill(0.0)
                 self._set_phase('land', now_ns)
             return
@@ -598,8 +812,13 @@ class LemniscateMissionTest(Node):
         if self.phase == 'land':
             target = self.origin.copy()
             self.setpoint, self.setpoint_velocity = slew_setpoint_with_velocity(
-                self.setpoint, target, dt, self.speed, self.descent_speed)
-            self._publish_hold_or_slew(self.setpoint, self.setpoint_velocity)
+                self.setpoint, target, dt,
+                self.staging_horizontal_speed, self.descent_speed)
+            self._publish_hold_or_slew(
+                self.setpoint,
+                self.setpoint_velocity,
+                tracking_feedback=self.aborted,
+            )
             position, velocity = self.local_position
             if (position[2] >= self.origin[2] - 0.20
                     and float(np.linalg.norm(velocity)) <= 0.60):

@@ -22,6 +22,7 @@ class TrajectoryReference:
     yawspeed: float
     position_mask: np.ndarray
     velocity_mask: np.ndarray
+    acceleration_mask: np.ndarray
 
 
 def _trajectory_vector(values, name):
@@ -77,6 +78,7 @@ def resolve_trajectory_reference(message, position, velocity, fallback_yaw):
         yawspeed,
         position_mask,
         velocity_mask,
+        acceleration_mask,
     )
 
 
@@ -106,20 +108,39 @@ class PositionController:
         velocity_error = np.clip(
             velocity_error, -self.cfg.velocity_error_limit,
             self.cfg.velocity_error_limit)
+        tracking_reference = bool(np.any(reference.acceleration_mask))
+        position_gain = (
+            self.cfg.tracking_position_gain
+            if tracking_reference else self.cfg.position_gain)
+        velocity_gain = (
+            self.cfg.tracking_velocity_gain
+            if tracking_reference else self.cfg.velocity_gain)
         r_ned_to_ts = np.asarray(r_ts_to_ned, dtype=float).T
         feedback_ts = (
-            self.cfg.position_gain * (r_ned_to_ts @ position_error)
-            + self.cfg.velocity_gain * (r_ned_to_ts @ velocity_error)
+            position_gain * (r_ned_to_ts @ position_error)
+            + velocity_gain * (r_ned_to_ts @ velocity_error)
             + self.cfg.linear_acceleration_gain
             * (r_ned_to_ts @ acceleration_error)
         )
-        command = reference.acceleration + r_ts_to_ned @ feedback_ts
-        horizontal = self._limit_norm(command[:2], self.cfg.horizontal_acceleration_limit)
-        return np.array([
-            horizontal[0], horizontal[1],
-            np.clip(command[2], -self.cfg.vertical_acceleration_limit,
-                    self.cfg.vertical_acceleration_limit),
+        feedback_ned = r_ts_to_ned @ feedback_ts
+        horizontal_limit = (
+            self.cfg.tracking_horizontal_acceleration_limit
+            if tracking_reference else self.cfg.horizontal_acceleration_limit)
+        vertical_limit = (
+            self.cfg.tracking_vertical_acceleration_limit
+            if tracking_reference else self.cfg.vertical_acceleration_limit)
+        horizontal_feedback = self._limit_norm(
+            feedback_ned[:2], horizontal_limit)
+        limited_feedback = np.array([
+            horizontal_feedback[0],
+            horizontal_feedback[1],
+            np.clip(
+                feedback_ned[2],
+                -vertical_limit,
+                vertical_limit,
+            ),
         ])
+        return reference.acceleration + limited_feedback
 
 
 class LinearAccelerationINDIController:
@@ -164,6 +185,38 @@ class LinearAccelerationINDIController:
         indi_force = values[2] + self.cfg.mass * (values[0] - values[1])
         blend = self.cfg.linear_indi_blend
         return nominal_force + blend * (indi_force - nominal_force)
+
+
+def apply_takeoff_force_floor(force_ned, nominal_force_ned, estimated_force_ned,
+                              position_ned, reference, config):
+    """Keep ground-start INDI takeoff from losing gravity compensation."""
+    force = np.asarray(force_ned, dtype=float).copy()
+    nominal = np.asarray(nominal_force_ned, dtype=float)
+    estimated = np.asarray(estimated_force_ned, dtype=float)
+    position = np.asarray(position_ned, dtype=float)
+    values = (force, nominal, estimated, position)
+    if any(value.shape != (3,) or not np.all(np.isfinite(value)) for value in values):
+        raise ValueError('takeoff force floor inputs must be finite 3-vectors')
+
+    climbing_reference = (
+        bool(reference.position_mask[2] and reference.position[2] < position[2] - 0.05)
+        or bool(reference.velocity_mask[2] and reference.velocity[2] < -0.05)
+        or bool(reference.acceleration[2] < -0.2)
+    )
+    upward_force_estimate = max(0.0, -float(estimated[2]))
+    if (climbing_reference
+            and upward_force_estimate
+            < config.takeoff_force_floor_trigger_scale * config.hover_total_thrust):
+        # NED z force is negative upward, so the smaller value is the stronger
+        # upward command.  Suppress horizontal force until the motors have built
+        # enough estimated lift for the regular INDI loop to take over.
+        upward_floor = min(
+            max(0.0, -float(nominal[2])),
+            config.takeoff_force_floor_max_scale * config.hover_total_thrust,
+        )
+        force[:2] = 0.0
+        force[2] = min(force[2], -upward_floor)
+    return force
 
 
 class HoverForceSlewLimiter:

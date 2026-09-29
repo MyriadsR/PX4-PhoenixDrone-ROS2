@@ -122,12 +122,12 @@ def test_flatness_port_matches_reference_regression_values():
     )
     np.testing.assert_allclose(
         result[0],
-        [-0.918018434787, 0.090324592505, -0.379685604015,
-         -0.070160269979],
+        [-0.930432603942, 0.087879431638, -0.348158260028,
+         -0.073199733536],
         atol=1e-11,
     )
     np.testing.assert_allclose(
-        result[1:], [4.247891588531, 6.170384653873, 0.830574127239],
+        result[1:], [4.104755916830, 6.170384653873, 0.762356388924],
         atol=1e-11,
     )
     rates = controller.feedforward_rates(
@@ -142,6 +142,6 @@ def test_flatness_port_matches_reference_regression_values():
         0.13,
     )
     np.testing.assert_allclose(
-        rates, [-0.059124639249, -0.053191753453, 0.039040096428],
+        rates, [-0.055596667433, -0.049654075288, 0.043628826487],
         atol=1e-11,
     )

@@ -11,6 +11,7 @@ from phoenix_tailsitter_control.position_control import (
     HoverForceSlewLimiter,
     LinearAccelerationINDIController,
     PositionController,
+    apply_takeoff_force_floor,
     degraded_vertical_force,
     force_to_tailsitter_attitude,
     limit_hover_force,
@@ -87,6 +88,7 @@ def test_trajectory_nan_semantics_hold_finite_position_with_zero_velocity():
     np.testing.assert_allclose(reference.velocity, [0.0, 0.2, 0.0])
     np.testing.assert_array_equal(reference.position_mask, [True, False, True])
     np.testing.assert_array_equal(reference.velocity_mask, [True, True, True])
+    np.testing.assert_array_equal(reference.acceleration_mask, [False] * 3)
     np.testing.assert_allclose(reference.acceleration, np.zeros(3))
     assert reference.yaw == 0.7
     assert reference.yawspeed == 0.0
@@ -103,6 +105,49 @@ def test_position_feedback_moves_toward_positive_north_reference():
         C_PX4_TS)
     assert command[0] > 0.0
     np.testing.assert_allclose(command[1:], np.zeros(2), atol=1e-12)
+
+
+def test_position_feedback_limits_do_not_clip_trajectory_feedforward():
+    cfg = PhoenixHoverConfig()
+    controller = PositionController(cfg)
+    acceleration = np.array([2.0, -3.0, 4.0])
+    reference = resolve_trajectory_reference(
+        trajectory([math.nan] * 3, [math.nan] * 3, acceleration),
+        np.zeros(3), np.zeros(3), 0.0)
+
+    command = controller.acceleration_command(
+        reference, np.zeros(3), np.zeros(3), np.zeros(3), C_PX4_TS)
+
+    np.testing.assert_allclose(command, acceleration)
+
+
+def test_tracking_reference_uses_separate_maneuver_gains():
+    cfg = PhoenixHoverConfig()
+    controller = PositionController(cfg)
+    position = np.zeros(3)
+    velocity = np.zeros(3)
+    position_only = resolve_trajectory_reference(
+        trajectory([0.01, 0.0, 0.0], [0.01, 0.0, 0.0], [math.nan] * 3),
+        position, velocity, 0.0)
+    tracking = resolve_trajectory_reference(
+        trajectory([0.01, 0.0, 0.0], [0.01, 0.0, 0.0], [0.0] * 3),
+        position, velocity, 0.0)
+
+    position_command = controller.acceleration_command(
+        position_only, position, velocity, np.zeros(3), np.eye(3))
+    tracking_command = controller.acceleration_command(
+        tracking, position, velocity, np.zeros(3), np.eye(3))
+
+    np.testing.assert_allclose(
+        position_command[0],
+        0.01 * (cfg.position_gain[0] + cfg.velocity_gain[0]),
+    )
+    np.testing.assert_allclose(
+        tracking_command[0],
+        0.01 * (
+            cfg.tracking_position_gain[0] + cfg.tracking_velocity_gain[0]),
+    )
+    assert tracking_command[0] != position_command[0]
 
 
 def test_linear_indi_preserves_estimated_hover_force_at_zero_error():
@@ -124,6 +169,36 @@ def test_linear_indi_blends_nominal_and_incremental_force():
     indi = cfg.mass * np.ones(3)
     np.testing.assert_allclose(result, nominal + cfg.linear_indi_blend * (indi - nominal))
     assert cfg.linear_indi_blend == 1.0
+
+
+def test_takeoff_force_floor_restores_gravity_compensation_when_ground_started():
+    cfg = PhoenixHoverConfig()
+    reference = resolve_trajectory_reference(
+        trajectory([0.0, 0.0, -1.0], [0.0, 0.0, -0.3], [0.0, 0.0, -1.0]),
+        np.zeros(3), np.zeros(3), 0.0)
+    force = np.array([0.4, -0.2, -3.4])
+    nominal = np.array([0.0, 0.0, -cfg.hover_total_thrust - cfg.mass])
+    estimated = np.array([0.0, 0.0, -3.0])
+
+    result = apply_takeoff_force_floor(
+        force, nominal, estimated, np.zeros(3), reference, cfg)
+
+    np.testing.assert_allclose(result, nominal)
+
+
+def test_takeoff_force_floor_keeps_airborne_indi_force_when_estimate_is_valid():
+    cfg = PhoenixHoverConfig()
+    reference = resolve_trajectory_reference(
+        trajectory([0.0, 0.0, -1.0], [0.0, 0.0, -0.3], [0.0, 0.0, -1.0]),
+        np.array([0.0, 0.0, -0.9]), np.zeros(3), 0.0)
+    force = np.array([0.2, -0.1, -6.9])
+    nominal = np.array([0.0, 0.0, -8.0])
+    estimated = np.array([0.0, 0.0, -0.9 * cfg.hover_total_thrust])
+
+    result = apply_takeoff_force_floor(
+        force, nominal, estimated, np.array([0.0, 0.0, -0.9]), reference, cfg)
+
+    np.testing.assert_allclose(result, force)
 
 
 def test_force_estimate_uses_ts_axes_and_phoenix_aero_force_directions():

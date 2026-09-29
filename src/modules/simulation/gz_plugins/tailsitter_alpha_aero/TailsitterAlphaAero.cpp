@@ -22,15 +22,22 @@ namespace phoenix
 {
 
 double TailsitterAlphaAero::ReadDouble(
-	const std::shared_ptr<const sdf::Element> &_sdf,
-	const std::string &_name, double _default) const
+		const std::shared_ptr<const sdf::Element> &_sdf,
+		const std::string &_name, double _default) const
 {
 	return _sdf->HasElement(_name) ? _sdf->Get<double>(_name) : _default;
 }
 
+int TailsitterAlphaAero::ReadInt(
+		const std::shared_ptr<const sdf::Element> &_sdf,
+		const std::string &_name, int _default) const
+{
+	return _sdf->HasElement(_name) ? _sdf->Get<int>(_name) : _default;
+}
+
 void TailsitterAlphaAero::Configure(const Entity &_entity,
-	const std::shared_ptr<const sdf::Element> &_sdf,
-	EntityComponentManager &_ecm, EventManager &)
+		const std::shared_ptr<const sdf::Element> &_sdf,
+		EntityComponentManager &_ecm, EventManager &)
 {
 	_model = Model(_entity);
 	if (!_model.Valid(_ecm)) {
@@ -74,11 +81,18 @@ void TailsitterAlphaAero::Configure(const Entity &_entity,
 	_c_lt_delta = ReadDouble(_sdf, "c_LT_delta", _c_lt_delta);
 	_alpha_zero = ReadDouble(_sdf, "alpha_0", _alpha_zero);
 	_alpha_thrust = ReadDouble(_sdf, "alpha_T", _alpha_thrust);
-	_motor_arm_y = ReadDouble(_sdf, "l_Ty", _motor_arm_y);
-	_flap_arm_y = ReadDouble(_sdf, "l_dy", _flap_arm_y);
-	_flap_arm_x = ReadDouble(_sdf, "l_dx", _flap_arm_x);
-	_rotor_velocity_slowdown = ReadDouble(
-		_sdf, "rotor_velocity_slowdown", _rotor_velocity_slowdown);
+		_motor_arm_y = ReadDouble(_sdf, "l_Ty", _motor_arm_y);
+		_flap_arm_y = ReadDouble(_sdf, "l_dy", _flap_arm_y);
+		_flap_arm_x = ReadDouble(_sdf, "l_dx", _flap_arm_x);
+		_motor_numbers[0] = ReadInt(_sdf, "left_motor_number", _motor_numbers[0]);
+		_motor_numbers[1] = ReadInt(_sdf, "right_motor_number", _motor_numbers[1]);
+		_max_motor_speed = ReadDouble(_sdf, "max_motor_speed", _max_motor_speed);
+		_motor_time_constant = ReadDouble(
+			_sdf, "motor_time_constant", _motor_time_constant);
+		_motor_input_scaling = ReadDouble(
+			_sdf, "motor_input_scaling", _motor_input_scaling);
+		_rotor_velocity_slowdown = ReadDouble(
+			_sdf, "rotor_velocity_slowdown", _rotor_velocity_slowdown);
 	_servo_time_constant = ReadDouble(
 		_sdf, "servo_time_constant", _servo_time_constant);
 	_servo_rate_limit = ReadDouble(
@@ -91,14 +105,28 @@ void TailsitterAlphaAero::Configure(const Entity &_entity,
 		_sdf->Get<std::string>("right_control_sub_topic")}};
 	const std::string left_topic = "/model/" + _model.Name(_ecm) + "/" + control_topics[0];
 	const std::string right_topic = "/model/" + _model.Name(_ecm) + "/" + control_topics[1];
-	if (!_node.Subscribe(left_topic,
-		&TailsitterAlphaAero::OnLeftFlapCommand, this)
-		|| !_node.Subscribe(right_topic,
-		&TailsitterAlphaAero::OnRightFlapCommand, this)) {
-		gzerr << "TailsitterAlphaAero failed to subscribe to flap commands\n";
-		return;
-	}
-	_configured = true;
+		if (!_node.Subscribe(left_topic,
+			&TailsitterAlphaAero::OnLeftFlapCommand, this)
+			|| !_node.Subscribe(right_topic,
+			&TailsitterAlphaAero::OnRightFlapCommand, this)) {
+			gzerr << "TailsitterAlphaAero failed to subscribe to flap commands\n";
+			return;
+		}
+		const std::string motor_sub_topic = _sdf->HasElement("motor_command_sub_topic")
+			? _sdf->Get<std::string>("motor_command_sub_topic")
+			: "command/motor_speed";
+		const std::string motor_topic = motor_sub_topic.empty()
+			? ""
+			: (motor_sub_topic[0] == '/'
+				? motor_sub_topic
+				: "/" + _model.Name(_ecm) + "/" + motor_sub_topic);
+		if (motor_topic.empty()
+			|| !_node.Subscribe(
+				motor_topic, &TailsitterAlphaAero::OnMotorCommand, this)) {
+			gzerr << "TailsitterAlphaAero failed to subscribe to motor commands\n";
+			return;
+		}
+		_configured = true;
 }
 
 void TailsitterAlphaAero::OnLeftFlapCommand(const msgs::Double &_msg)
@@ -109,6 +137,19 @@ void TailsitterAlphaAero::OnLeftFlapCommand(const msgs::Double &_msg)
 void TailsitterAlphaAero::OnRightFlapCommand(const msgs::Double &_msg)
 {
 	_flap_commands[1].store(_msg.data(), std::memory_order_relaxed);
+}
+
+void TailsitterAlphaAero::OnMotorCommand(const msgs::Actuators &_msg)
+{
+	for (int i = 0; i < 2; ++i) {
+		const int motor_number = _motor_numbers[i];
+		if (motor_number >= 0 && motor_number < _msg.velocity_size()) {
+			const double command = std::max(0.0, _msg.velocity(motor_number));
+			_motor_speed_commands[i].store(
+				command * _motor_input_scaling, std::memory_order_relaxed);
+		}
+	}
+	_motor_command_received.store(true, std::memory_order_relaxed);
 }
 
 math::Vector3d TailsitterAlphaAero::GzFluToTs(const math::Vector3d &_value)
@@ -196,12 +237,24 @@ void TailsitterAlphaAero::PreUpdate(const UpdateInfo &_info,
 	}
 
 	std::array<double, 2> motor_speed{};
+	const bool use_motor_commands = _motor_command_received.load(
+		std::memory_order_relaxed);
 	for (int i = 0; i < 2; ++i) {
-		const auto velocity = _motor_joints[i].Velocity(_ecm);
-		if (!velocity || velocity->empty()) {
-			return;
+		if (use_motor_commands) {
+			const double target = std::clamp(
+				_motor_speed_commands[i].load(std::memory_order_relaxed),
+				0.0, _max_motor_speed);
+			const double alpha = std::min(
+				1.0, dt / std::max(_motor_time_constant, 1e-4));
+			_motor_speed_state[i] += alpha * (target - _motor_speed_state[i]);
+			motor_speed[i] = _motor_speed_state[i];
+		} else {
+			const auto velocity = _motor_joints[i].Velocity(_ecm);
+			if (!velocity || velocity->empty()) {
+				return;
+			}
+			motor_speed[i] = std::abs((*velocity)[0]) * _rotor_velocity_slowdown;
 		}
-		motor_speed[i] = std::abs((*velocity)[0]) * _rotor_velocity_slowdown;
 		const double command = std::clamp(
 			_flap_commands[i].load(std::memory_order_relaxed),
 			-_flap_limit[i], _flap_limit[i]);

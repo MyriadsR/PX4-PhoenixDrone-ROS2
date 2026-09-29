@@ -492,18 +492,21 @@ class TailsitterController(Node):
         )
         output_active = mode_ready and output_enabled and feedback_ready
         source = str(self.get_parameter('setpoint_source').value).lower()
-        if output_active and not self.previous_output_active and source == 'trajectory':
-            # Seed the fallback predictor at hover on takeover so incremental
-            # force control does not mistake ground contact for a zero-thrust
-            # airborne equilibrium when joint feedback is unavailable.
-            hover_motor_speed = math.sqrt(
-                self.cfg.hover_total_thrust
-                / (2.0 * self.cfg.motor_thrust_coefficient))
-            self.motor_speed_prediction.fill(hover_motor_speed)
-            if not self.actuator_feedback_active:
-                self.motor_speed_estimate.fill(hover_motor_speed)
-            self.linear_acceleration_filter = None
-            self.force_filter = None
+        if output_active and not self.previous_output_active:
+            # A new arm/offboard takeover must not inherit the previous
+            # mission's yaw fallback or INDI filter equilibrium.
+            self._reset_dynamic_state()
+            if source == 'trajectory':
+                # Seed the fallback predictor at hover on takeover so
+                # incremental force control does not mistake ground contact
+                # for a zero-thrust airborne equilibrium when joint feedback
+                # is unavailable.
+                hover_motor_speed = math.sqrt(
+                    self.cfg.hover_total_thrust
+                    / (2.0 * self.cfg.motor_thrust_coefficient))
+                self.motor_speed_prediction.fill(hover_motor_speed)
+                if not self.actuator_feedback_active:
+                    self.motor_speed_estimate.fill(hover_motor_speed)
 
         desired = self._desired_state(now_ns, q_current_ts)
         if desired is None:

@@ -20,6 +20,7 @@ from .flatness_control import FlatnessAttitudeController
 from .frames import attitude_px4_to_ts, vector_px4_to_ts
 from .math_utils import quaternion_to_matrix, rotation_vector_error
 from .position_control import (
+    apply_takeoff_force_floor,
     degraded_vertical_force,
     resolve_trajectory_reference,
     tailsitter_heading_from_attitude,
@@ -182,10 +183,22 @@ class AlphaTailsitterController(TailsitterController):
             self.flap_angle_without_transient,
         )
         estimated_force_lpf_ned = r_alpha_to_ned @ steady_model.force_alpha
-        force_command = (
-            estimated_force_lpf_ned
-            + self.cfg.mass
-            * (acceleration_command - acceleration_without_flap_transient)
+        force_command = self.linear_controller.force_command(
+            acceleration_command,
+            acceleration_without_flap_transient,
+            estimated_force_lpf_ned,
+        )
+        reference_force = self.cfg.mass * (
+            reference.acceleration
+            - np.array([0.0, 0.0, self.cfg.gravity]))
+        force_command = apply_takeoff_force_floor(
+            force_command,
+            self.cfg.mass * (
+                acceleration_command - np.array([0.0, 0.0, self.cfg.gravity])),
+            estimated_force_lpf_ned,
+            position,
+            reference,
+            self.cfg,
         )
         flap_sum = float(np.sum(self.flap_angle_without_transient))
         try:
@@ -197,9 +210,6 @@ class AlphaTailsitterController(TailsitterController):
                     reference.yaw,
                     q_current_ts,
                 ))
-            reference_force = self.cfg.mass * (
-                reference.acceleration
-                - np.array([0.0, 0.0, self.cfg.gravity]))
             _, _, reference_roll, reference_pitch_bar = (
                 self.flatness_controller.attitude_and_thrust(
                     reference_force,
@@ -342,6 +352,11 @@ class AlphaTailsitterController(TailsitterController):
         )
         source = str(self.get_parameter('setpoint_source').value).lower()
         if output_active and not self.previous_output_active:
+            # Reset the complete controller state before a new arm/offboard
+            # takeover.  In particular, NaN-yaw staging setpoints must fall
+            # back to the current attitude instead of the previous mission's
+            # final trajectory yaw.
+            self._reset_dynamic_state()
             if source == 'trajectory':
                 hover_speed = math.sqrt(
                     self.cfg.hover_total_thrust
@@ -354,7 +369,6 @@ class AlphaTailsitterController(TailsitterController):
                 # measured/predicted actuator path.
                 self.motor_speed_estimate.fill(hover_speed)
                 self.linear_acceleration_filter = None
-            self._reset_alpha_filters()
 
         self._update_alpha_filters()
         r_ts_to_ned = quaternion_to_matrix(q_current_ts)
