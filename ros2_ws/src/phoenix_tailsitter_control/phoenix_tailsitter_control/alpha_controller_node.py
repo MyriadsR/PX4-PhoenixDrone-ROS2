@@ -15,7 +15,7 @@ from .debug import (
     pack_control_debug,
     pack_position_debug,
 )
-from .filters import ButterworthHighPass, ButterworthLowPass
+from .filters import TimeAwareButterworth
 from .flatness_control import FlatnessAttitudeController
 from .frames import attitude_px4_to_ts, vector_px4_to_ts
 from .math_utils import quaternion_to_matrix, rotation_vector_error
@@ -32,6 +32,16 @@ class AlphaTailsitterController(TailsitterController):
 
     def __init__(self):
         super().__init__()
+        self.declare_parameter('use_measured_control_dt', False)
+        self.use_measured_control_dt = bool(
+            self.get_parameter('use_measured_control_dt').value)
+        self.previous_control_ns = None
+        self.tracking_gain_blend = 0.0
+        self.filter_dt_s = 1.0 / self.cfg.control_rate_hz
+        self.timing_intervals = []
+        self.timing_last_publish_ns = 0
+        self.timing_debug_publisher = self.create_publisher(
+            Float64MultiArray, '/phoenix_tailsitter/timing_debug', 10)
         self.aerodynamics = AlphaAerodynamics(self.cfg)
         self.allocator = AlphaTheoryAllocator(self.cfg)
         self.flatness_controller = FlatnessAttitudeController(self.cfg)
@@ -63,33 +73,36 @@ class AlphaTailsitterController(TailsitterController):
         # executor, but guard the attributes to keep reset independently safe.
         if hasattr(self, 'motor_speed_lpf'):
             self._reset_alpha_filters()
+            self.tracking_gain_blend = 0.0
 
     def _update_alpha_filters(self):
         if self.alpha_motor_filter is None:
-            self.alpha_motor_filter = ButterworthLowPass(
+            self.alpha_motor_filter = TimeAwareButterworth(
                 self.cfg.indi_lpf_cutoff_hz,
                 self.cfg.control_rate_hz,
                 2,
                 self.motor_speed_estimate,
             )
-            self.alpha_flap_filter = ButterworthLowPass(
+            self.alpha_flap_filter = TimeAwareButterworth(
                 self.cfg.indi_lpf_cutoff_hz,
                 self.cfg.control_rate_hz,
                 2,
                 self.flap_angle_estimate,
             )
-            self.alpha_flap_hpf_filter = ButterworthHighPass(
+            self.alpha_flap_hpf_filter = TimeAwareButterworth(
                 self.cfg.flap_hpf_cutoff_hz,
                 self.cfg.control_rate_hz,
                 2,
                 self.flap_angle_estimate,
+                high_pass=True,
             )
         self.motor_speed_lpf = np.maximum(
-            self.alpha_motor_filter.update(self.motor_speed_estimate), 0.0)
+            self.alpha_motor_filter.update(
+                self.motor_speed_estimate, self.filter_dt_s), 0.0)
         self.flap_angle_lpf = self.alpha_flap_filter.update(
-            self.flap_angle_estimate)
+            self.flap_angle_estimate, self.filter_dt_s)
         self.flap_angle_hpf = self.alpha_flap_hpf_filter.update(
-            self.flap_angle_lpf)
+            self.flap_angle_lpf, self.filter_dt_s)
         self.flap_angle_without_transient = (
             self.flap_angle_lpf - self.flap_angle_hpf)
 
@@ -153,13 +166,14 @@ class AlphaTailsitterController(TailsitterController):
         self.trajectory_yaw = reference.yaw
 
         if self.linear_acceleration_filter is None:
-            self.linear_acceleration_filter = ButterworthLowPass(
+            self.linear_acceleration_filter = TimeAwareButterworth(
                 self.cfg.indi_lpf_cutoff_hz,
                 self.cfg.control_rate_hz,
                 3,
                 acceleration,
             )
-        acceleration_lpf = self.linear_acceleration_filter.update(acceleration)
+        acceleration_lpf = self.linear_acceleration_filter.update(
+            acceleration, self.filter_dt_s)
 
         flap_transient = self.aerodynamics.compute(
             velocity_body_ts,
@@ -313,7 +327,7 @@ class AlphaTailsitterController(TailsitterController):
         now_ns = self._now_ns()
         timestamp_us = now_ns // 1000
         self._publish_mode(timestamp_us)
-        dt = 1.0 / self.cfg.control_rate_hz
+        dt = self._update_control_timing(now_ns)
         self._update_actuator_estimate(dt, now_ns)
         self._publish_actuator_feedback_debug(now_ns)
 
@@ -400,13 +414,13 @@ class AlphaTailsitterController(TailsitterController):
             return
 
         if self.rate_filter is None:
-            self.rate_filter = ButterworthLowPass(
+            self.rate_filter = TimeAwareButterworth(
                 self.cfg.indi_lpf_cutoff_hz,
                 self.cfg.control_rate_hz,
                 3,
                 rates_ts,
             )
-            self.moment_filter = ButterworthLowPass(
+            self.moment_filter = TimeAwareButterworth(
                 self.cfg.indi_lpf_cutoff_hz,
                 self.cfg.control_rate_hz,
                 3,
@@ -414,19 +428,26 @@ class AlphaTailsitterController(TailsitterController):
             )
             self.previous_rate_lpf = rates_ts.copy()
 
-        rates_lpf_ts = self.rate_filter.update(rates_ts)
+        rates_lpf_ts = self.rate_filter.update(rates_ts, dt)
         acceleration_lpf_ts = (
             rates_lpf_ts - self.previous_rate_lpf) / dt
         self.previous_rate_lpf = rates_lpf_ts.copy()
         estimated_moment_lpf = self.moment_filter.update(
-            model_result.moment_body_ts)
+            model_result.moment_body_ts, dt)
 
         desired_q_ts, total_thrust, desired_rates_ts = desired
+        tracking = (
+            source == 'trajectory'
+            and self.trajectory_setpoint is not None
+            and np.any(np.isfinite(self.trajectory_setpoint.acceleration)))
+        self.tracking_gain_blend = float(np.clip(
+            self.tracking_gain_blend + (dt if tracking else -dt), 0.0, 1.0))
         acceleration_command = self.controller.angular_acceleration_command(
             q_current_ts,
             desired_q_ts,
             rates_lpf_ts,
             desired_rates_ts,
+            tracking_blend=self.tracking_gain_blend,
         )
         desired_moment = self.controller.moment_command(
             acceleration_command,
@@ -462,6 +483,33 @@ class AlphaTailsitterController(TailsitterController):
             self.flap_target.fill(0.0)
             self._publish_actuators(timestamp_us, np.zeros(2), np.zeros(2))
         self.previous_output_active = output_active
+
+    def _update_control_timing(self, now_ns):
+        nominal_dt = 1.0 / self.cfg.control_rate_hz
+        elapsed = (nominal_dt if self.previous_control_ns is None else
+                   (now_ns - self.previous_control_ns) * 1e-9)
+        self.previous_control_ns = now_ns
+        if not 0.0 < elapsed <= self.cfg.state_timeout_s:
+            self._reset_dynamic_state()
+            elapsed = nominal_dt
+        self.filter_dt_s = (
+            elapsed if self.use_measured_control_dt else nominal_dt)
+        self.timing_intervals.append(elapsed)
+        if now_ns - self.timing_last_publish_ns >= int(0.1e9):
+            message = Float64MultiArray()
+            # Mean/min/max callback dt, filter dt, and arrival ages (seconds).
+            message.data = [
+                float(np.mean(self.timing_intervals)),
+                min(self.timing_intervals), max(self.timing_intervals),
+                self.filter_dt_s,
+                max(0.0, (now_ns - self.rates_arrival_ns) * 1e-9),
+                max(0.0, (now_ns - self.local_position_arrival_ns) * 1e-9),
+                max(0.0, (now_ns - self.actuator_feedback_arrival_ns) * 1e-9),
+            ]
+            self.timing_debug_publisher.publish(message)
+            self.timing_intervals.clear()
+            self.timing_last_publish_ns = now_ns
+        return self.filter_dt_s
 
 
 def main(args=None):

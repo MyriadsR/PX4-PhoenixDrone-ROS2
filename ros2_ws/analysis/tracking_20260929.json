@@ -1,0 +1,94 @@
+[
+  {
+    "bag": "/tmp/phoenix_improve_fixed",
+    "mission": {
+      "aborted": false,
+      "exit_horizontal_bound_m": 11.081449596107907,
+      "horizontal_bound_m": 11.081449596107907,
+      "lap_time_s": 7.0,
+      "laps": 1,
+      "passed": true,
+      "position_max_ned_m": [
+        2.7032554149627686,
+        3.08282470703125,
+        -0.015791703015565872
+      ],
+      "position_min_ned_m": [
+        -10.210956573486328,
+        -6.015048980712891,
+        -2.3568124771118164
+      ],
+      "scale_m": 6.674147930640862,
+      "speed_m_s": 5.0,
+      "speed_peak_m_s": 6.880844832156548,
+      "takeoff_height_m": 2.0,
+      "track_passed": true,
+      "track_peak_error_m": 2.205678493631421,
+      "track_rms_error_m": 1.332744570911442,
+      "track_sample_count": 140
+    },
+    "debug_rms_m": 1.2967858719646859
+  },
+  {
+    "bag": "/tmp/phoenix_improve_damped3",
+    "mission": {
+      "aborted": false,
+      "exit_horizontal_bound_m": 11.081449596107907,
+      "horizontal_bound_m": 11.081449596107907,
+      "lap_time_s": 7.0,
+      "laps": 1,
+      "passed": true,
+      "position_max_ned_m": [
+        2.6331546306610107,
+        4.031455993652344,
+        -0.03128333389759064
+      ],
+      "position_min_ned_m": [
+        -10.700004577636719,
+        -5.3280744552612305,
+        -2.0798821449279785
+      ],
+      "reference_rate_hz": 20.0,
+      "scale_m": 6.674147930640862,
+      "speed_m_s": 5.0,
+      "speed_peak_m_s": 5.436605830009699,
+      "takeoff_height_m": 2.0,
+      "track_passed": true,
+      "track_peak_error_m": 1.8731973560574544,
+      "track_rms_error_m": 0.9432042984536766,
+      "track_sample_count": 139
+    },
+    "debug_rms_m": 1.0148970955301424
+  },
+  {
+    "bag": "/tmp/phoenix_improve_damped3_multilap",
+    "mission": {
+      "aborted": false,
+      "exit_horizontal_bound_m": 11.081449596107907,
+      "horizontal_bound_m": 11.081449596107907,
+      "lap_time_s": 7.0,
+      "laps": 3,
+      "passed": true,
+      "position_max_ned_m": [
+        2.700085401535034,
+        4.986152648925781,
+        0.017587658017873764
+      ],
+      "position_min_ned_m": [
+        -10.983308792114258,
+        -5.2581706047058105,
+        -2.086287260055542
+      ],
+      "reference_rate_hz": 20.0,
+      "scale_m": 6.674147930640862,
+      "speed_m_s": 5.0,
+      "speed_peak_m_s": 5.411371394651015,
+      "takeoff_height_m": 2.0,
+      "track_passed": true,
+      "track_peak_error_m": 1.8113852608738736,
+      "track_rms_error_m": 0.680507000148214,
+      "track_sample_count": 420
+    },
+    "debug_rms_m": 0.7307467522621222
+  }
+]

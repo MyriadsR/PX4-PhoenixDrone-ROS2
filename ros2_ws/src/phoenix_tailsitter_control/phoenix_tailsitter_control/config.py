@@ -64,7 +64,9 @@ class PhoenixHoverConfig:
     indi_lpf_cutoff_hz: float = 15.0
     linear_indi_lpf_cutoff_hz: float = 5.0
     state_timeout_s: float = 0.10
-    control_mode_timeout_s: float = 0.50
+    # PX4 publishes vehicle_control_mode every 0.5 s; allow transport jitter
+    # without briefly zeroing both motors between otherwise healthy updates.
+    control_mode_timeout_s: float = 1.50
     setpoint_timeout_s: float = 0.50
 
     # PX4/Gazebo inner-loop gains in TS body axes.  The much larger gains from
@@ -72,6 +74,11 @@ class PhoenixHoverConfig:
     # actuator chain during the ground-to-flight transient.
     attitude_gain: np.ndarray = field(default_factory=lambda: np.array([6.0, 6.0, 6.0]))
     rate_gain: np.ndarray = field(default_factory=lambda: np.array([3.0, 3.0, 3.0]))
+    # Transition to maneuver gains only with explicit acceleration references.
+    tracking_attitude_gain: np.ndarray = field(
+        default_factory=lambda: np.array([78.4, 54.88, 54.88]))
+    tracking_rate_gain: np.ndarray = field(
+        default_factory=lambda: np.array([14.0, 9.8, 9.8]))
     angular_acceleration_limit: np.ndarray = field(
         default_factory=lambda: np.array([20.0, 15.0, 24.0]))
     moment_limit: np.ndarray = field(default_factory=lambda: np.array([0.25, 0.08, 0.35]))
@@ -88,7 +95,7 @@ class PhoenixHoverConfig:
     # more velocity damping there without changing the proven takeoff/landing
     # gains used by position-only staging setpoints.
     tracking_position_gain: np.ndarray = field(
-        default_factory=lambda: np.array([2.0, 1.5, 2.25]))
+        default_factory=lambda: np.array([4.0, 2.0, 3.0]))
     tracking_velocity_gain: np.ndarray = field(
         default_factory=lambda: np.array([4.0, 3.0, 3.0]))
     linear_acceleration_gain: np.ndarray = field(
@@ -104,7 +111,7 @@ class PhoenixHoverConfig:
     # Gazebo cannot tolerate the ideal model's unbounded Eq. 41 feedback.  Keep
     # staging conservative and use the stable maneuver envelope identified in
     # closed-loop SITL testing.
-    tracking_horizontal_acceleration_limit: float = 2.00
+    tracking_horizontal_acceleration_limit: float = 3.00
     tracking_vertical_acceleration_limit: float = 1.50
     position_tilt_limit_rad: float = float(np.deg2rad(89.0))
     horizontal_force_slew_rate_n_s: float = 1.0e6

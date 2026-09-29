@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import numpy as np
 
 from phoenix_tailsitter_control.allocator import PhoenixHoverAllocator
@@ -8,6 +10,7 @@ from phoenix_tailsitter_control.attitude_step_test import (
     summarize_axis_response,
 )
 from phoenix_tailsitter_control.config import PhoenixHoverConfig
+from phoenix_tailsitter_control.controller_node import TailsitterController
 from phoenix_tailsitter_control.debug import (
     ACTUATOR_FEEDBACK_DEBUG_FIELDS,
     CONTROL_DEBUG_FIELDS,
@@ -17,6 +20,17 @@ from phoenix_tailsitter_control.debug import (
     pack_position_debug,
 )
 from phoenix_tailsitter_control.filters import ButterworthLowPass
+
+
+def test_control_mode_remains_fresh_across_normal_px4_publish_interval():
+    cfg = PhoenixHoverConfig()
+    controller = SimpleNamespace(
+        cfg=cfg,
+        control_mode=object(),
+        control_mode_arrival_ns=1_000_000_000,
+    )
+    assert TailsitterController._mode_is_fresh(controller, 1_600_000_000)
+    assert not TailsitterController._mode_is_fresh(controller, 2_600_000_000)
 
 
 def test_filter_starts_at_steady_state():
@@ -33,6 +47,21 @@ def test_zero_attitude_error_produces_zero_angular_acceleration():
         controller.angular_acceleration_command(q, q, np.zeros(3)),
         np.zeros(3),
     )
+
+
+def test_maneuver_gains_blend_without_changing_default_hover_control():
+    controller = AttitudeINDIController(PhoenixHoverConfig())
+    q = np.array([1.0, 0.0, 0.0, 0.0])
+    desired = axis_angle_quaternion(2, 0.1)
+    rates = np.array([0.1, 0.1, 0.1])
+    hover = controller.angular_acceleration_command(q, desired, rates)
+    tracking = controller.angular_acceleration_command(
+        q, desired, rates, tracking_blend=1.0)
+    halfway = controller.angular_acceleration_command(
+        q, desired, rates, tracking_blend=0.5)
+    np.testing.assert_allclose(hover, [-0.3, -0.3, 0.3], atol=1e-12)
+    np.testing.assert_allclose(halfway, 0.5 * (hover + tracking), atol=1e-12)
+    assert tracking[2] > hover[2]
 
 
 def test_hover_allocation_uses_equal_motors_and_zero_flaps():

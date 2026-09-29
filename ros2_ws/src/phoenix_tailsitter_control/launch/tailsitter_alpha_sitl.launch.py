@@ -29,6 +29,7 @@ def generate_launch_description():
     setpoint_frame = LaunchConfiguration('setpoint_frame')
     feedback_enabled = LaunchConfiguration('feedback_enabled')
     actuator_feedback_mode = LaunchConfiguration('actuator_feedback_mode')
+    use_measured_control_dt = LaunchConfiguration('use_measured_control_dt')
     return LaunchDescription([
         DeclareLaunchArgument('headless', default_value='true'),
         DeclareLaunchArgument('controller_enabled', default_value='true'),
@@ -37,6 +38,7 @@ def generate_launch_description():
         DeclareLaunchArgument('setpoint_frame', default_value='px4'),
         DeclareLaunchArgument('feedback_enabled', default_value='true'),
         DeclareLaunchArgument('actuator_feedback_mode', default_value='auto'),
+        DeclareLaunchArgument('use_measured_control_dt', default_value='false'),
         ExecuteProcess(
             cmd=[str(AGENT), 'udp4', '-p', '8888'],
             additional_env={
@@ -97,6 +99,8 @@ def generate_launch_description():
                 'setpoint_frame': setpoint_frame,
                 'actuator_feedback_mode': actuator_feedback_mode,
                 'actuator_feedback_topic': FEEDBACK_TOPIC,
+                'use_measured_control_dt': ParameterValue(
+                    use_measured_control_dt, value_type=bool),
             }],
             condition=IfCondition(controller_enabled),
             output='screen',

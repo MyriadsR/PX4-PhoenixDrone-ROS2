@@ -5,6 +5,55 @@ import math
 import numpy as np
 
 
+class TimeAwareButterworth:
+    """Two-pole Butterworth with physical states and a variable sample period.
+
+    Trapezoidal integration equals the fixed-rate bilinear filter at its
+    nominal period. Physical states remain valid when dt changes.
+    """
+
+    def __init__(self, cutoff_hz, sample_rate_hz, channels, initial_value,
+                 *, high_pass=False):
+        if (not math.isfinite(cutoff_hz) or not math.isfinite(sample_rate_hz)
+                or not 0.0 < cutoff_hz < 0.5 * sample_rate_hz):
+            raise ValueError('cutoff must be finite, positive and below Nyquist')
+        self.channels = int(channels)
+        if self.channels <= 0 or self.channels != channels:
+            raise ValueError('channels must be a positive integer')
+        self.nominal_dt = 1.0 / sample_rate_hz
+        self.frequency = 2.0 * sample_rate_hz * math.tan(
+            math.pi * cutoff_hz / sample_rate_hz)
+        self.high_pass = bool(high_pass)
+        self.position = self._sample(initial_value).copy()
+        self.velocity = np.zeros(self.channels)
+        self.previous_input = self.position.copy()
+
+    def _sample(self, value):
+        sample = np.asarray(value, dtype=float)
+        if sample.shape != (self.channels,) or not np.all(np.isfinite(sample)):
+            raise ValueError(f'filter sample must be {self.channels} finite values')
+        return sample
+
+    def update(self, value, dt=None):
+        sample = self._sample(value)
+        dt = self.nominal_dt if dt is None else float(dt)
+        if not math.isfinite(dt) or dt <= 0.0:
+            raise ValueError('filter dt must be finite and positive')
+        h = 0.5 * self.frequency * dt
+        damping = math.sqrt(2.0)
+        rhs_position = self.position + h * self.velocity
+        rhs_velocity = (
+            -h * self.position + (1.0 - damping * h) * self.velocity
+            + h * (self.previous_input + sample))
+        self.velocity = (rhs_velocity - h * rhs_position) / (
+            1.0 + damping * h + h * h)
+        self.position = rhs_position + h * self.velocity
+        self.previous_input = sample.copy()
+        if self.high_pass:
+            return sample - self.position - damping * self.velocity
+        return self.position.copy()
+
+
 class ButterworthLowPass:
     """Fixed-rate, two-pole low-pass using a transposed direct-form II biquad."""
 

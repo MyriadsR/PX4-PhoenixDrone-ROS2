@@ -10,6 +10,7 @@ from px4_msgs.msg import (
     TrajectorySetpoint,
     VehicleCommand,
     VehicleControlMode,
+    VehicleLandDetected,
     VehicleLocalPosition,
     VehicleStatus,
 )
@@ -18,6 +19,47 @@ from rclpy.node import Node
 
 from .position_mission_test import slew_setpoint_with_velocity, target_is_stable
 from .qos import PX4_INPUT_QOS, PX4_OUTPUT_QOS
+
+
+def landing_descent_allowed(position, velocity, setpoint,
+                            horizontal_tolerance=0.75,
+                            horizontal_speed_tolerance=0.50):
+    """Keep altitude until horizontal error and drift are under control."""
+    return (
+        np.linalg.norm(np.asarray(position)[:2] - np.asarray(setpoint)[:2])
+        <= horizontal_tolerance
+        and np.linalg.norm(np.asarray(velocity)[:2])
+        <= horizontal_speed_tolerance
+    )
+
+
+def landing_disarm_allowed(position, velocity, origin, landed_confirmed):
+    """Accept PX4 touchdown near the ground despite local-height bias."""
+    return (
+        np.linalg.norm(velocity) <= 0.60
+        and (position[2] >= origin[2] - 0.20
+             or (landed_confirmed and position[2] >= origin[2] - 0.60))
+    )
+
+
+def landed_state_confirmed(count, first_ns, last_ns, now_ns):
+    """Require two fresh landed reports spanning at least half a second."""
+    return (
+        count >= 2
+        and first_ns is not None
+        and last_ns is not None
+        and last_ns - first_ns >= int(0.5e9)
+        and 0 <= now_ns - last_ns <= int(1.5e9)
+    )
+
+
+def near_ground_runaway(position, origin, horizontal_limit):
+    """Detect an aborted SITL flight escaping the test area near the floor."""
+    relative = np.asarray(position) - np.asarray(origin)
+    return (
+        relative[2] >= -0.60
+        and np.linalg.norm(relative[:2]) > horizontal_limit
+    )
 
 
 CONFIRMATION = 'PHOENIX_LEMNISCATE_MISSION_TEST'
@@ -71,6 +113,33 @@ def smooth_stop_sample(start_position, start_velocity, t, duration, target_z):
     jerk = velocity_0 * path_jerk
     yaw = float(math.atan2(velocity_0[1], velocity_0[0]))
     return LemniscateSample(position, velocity, acceleration, jerk, yaw, 0.0)
+
+
+def abort_brake_sample(start_position, start_velocity, t, duration, target_z):
+    """Brake horizontally while climbing smoothly to a safe height."""
+    sample = smooth_stop_sample(
+        start_position, start_velocity, t, duration, start_position[2])
+    if not math.isfinite(target_z):
+        raise ValueError('abort brake target z must be finite')
+    ratio = float(np.clip(t / duration, 0.0, 1.0))
+    delta_z = target_z - start_position[2]
+    position = sample.position.copy()
+    velocity = sample.velocity.copy()
+    acceleration = sample.acceleration.copy()
+    jerk = sample.jerk.copy()
+    position[2] += delta_z * (
+        10.0 * ratio**3 - 15.0 * ratio**4 + 6.0 * ratio**5)
+    velocity[2] = delta_z * (
+        30.0 * ratio**2 - 60.0 * ratio**3 + 30.0 * ratio**4
+    ) / duration
+    acceleration[2] = delta_z * (
+        60.0 * ratio - 180.0 * ratio**2 + 120.0 * ratio**3
+    ) / duration**2
+    jerk[2] = delta_z * (
+        60.0 - 360.0 * ratio + 360.0 * ratio**2
+    ) / duration**3
+    return LemniscateSample(
+        position, velocity, acceleration, jerk, sample.yaw, 0.0)
 
 
 def _bernoulli_lemniscate_derivatives(parameter):
@@ -306,6 +375,7 @@ class LemniscateMissionTest(Node):
         self.declare_parameter('confirmation', '')
         self.declare_parameter('speed_m_s', 6.0)
         self.declare_parameter('lap_time_s', 7.0)
+        self.declare_parameter('reference_rate_hz', 20.0)
         self.declare_parameter('laps', 8)
         self.declare_parameter('takeoff_height_m', 10.0)
         self.declare_parameter('staging_horizontal_speed_m_s', 0.15)
@@ -324,10 +394,16 @@ class LemniscateMissionTest(Node):
         self.declare_parameter('wait_timeout_s', 45.0)
         self.declare_parameter('takeoff_timeout_s', 60.0)
         self.declare_parameter('land_timeout_s', 60.0)
+        self.declare_parameter('test_abort_after_track_s', 0.0)
 
         if str(self.get_parameter('confirmation').value) != CONFIRMATION:
             raise ValueError(f'confirmation must equal {CONFIRMATION}')
 
+        self.reference_rate_hz = float(
+            self.get_parameter('reference_rate_hz').value)
+        if (not math.isfinite(self.reference_rate_hz)
+                or not 1.0 <= self.reference_rate_hz <= 200.0):
+            raise ValueError('reference_rate_hz must be between 1 and 200')
         self.speed = float(self.get_parameter('speed_m_s').value)
         self.lap_time = float(self.get_parameter('lap_time_s').value)
         self.laps = int(self.get_parameter('laps').value)
@@ -363,6 +439,8 @@ class LemniscateMissionTest(Node):
             self.get_parameter('takeoff_timeout_s').value)
         self.land_timeout_s = float(
             self.get_parameter('land_timeout_s').value)
+        self.test_abort_after_track_s = float(
+            self.get_parameter('test_abort_after_track_s').value)
 
         positive = (
             self.speed, self.lap_time, self.takeoff_height,
@@ -377,6 +455,9 @@ class LemniscateMissionTest(Node):
         )
         if not all(math.isfinite(value) and value > 0.0 for value in positive):
             raise ValueError('all timing, speed, tolerance, and limit values must be positive')
+        if (not math.isfinite(self.test_abort_after_track_s)
+                or self.test_abort_after_track_s < 0.0):
+            raise ValueError('test_abort_after_track_s must be finite and nonnegative')
         if self.speed > 8.0:
             raise ValueError('speed_m_s is limited to <= 8.0 for this SITL test')
         if self.takeoff_height > 12.0:
@@ -406,6 +487,11 @@ class LemniscateMissionTest(Node):
         self.track_started_ns = None
         self.entry_started_ns = None
         self.exit_started_ns = None
+        self.abort_brake_started_ns = None
+        self.abort_brake_position = None
+        self.abort_brake_velocity = None
+        self.abort_brake_duration_s = None
+        self.abort_brake_target_z = None
         self.exit_start_position = None
         self.exit_start_velocity = None
         self.exit_braking_duration_s = None
@@ -413,6 +499,10 @@ class LemniscateMissionTest(Node):
         self.last_tick_ns = None
         self.last_command_ns = 0
         self.disarm_started_ns = None
+        self.land_detected_started_ns = None
+        self.land_detected_arrival_ns = None
+        self.land_detected_count = 0
+        self.land_timeout_reported = False
         self.done = False
         self.aborted = False
         self.exit_code = 1
@@ -432,9 +522,12 @@ class LemniscateMissionTest(Node):
             VehicleControlMode, '/fmu/out/vehicle_control_mode',
             self._on_control_mode, PX4_OUTPUT_QOS)
         self.create_subscription(
+            VehicleLandDetected, '/fmu/out/vehicle_land_detected',
+            self._on_land_detected, PX4_OUTPUT_QOS)
+        self.create_subscription(
             VehicleStatus, '/fmu/out/vehicle_status_v1',
             self._on_vehicle_status, PX4_OUTPUT_QOS)
-        self.create_timer(0.05, self._tick)
+        self.create_timer(1.0 / self.reference_rate_hz, self._tick)
         self.get_logger().warning(
             'Prepared automated Bernoulli lemniscate mission: '
             f'speed={self.speed:.2f} m/s, lap_time={self.lap_time:.1f} s, '
@@ -462,6 +555,17 @@ class LemniscateMissionTest(Node):
 
     def _on_control_mode(self, message):
         self.control_mode = message
+
+    def _on_land_detected(self, message):
+        now_ns = self.get_clock().now().nanoseconds
+        self.land_detected_arrival_ns = now_ns
+        if message.landed:
+            if self.land_detected_started_ns is None:
+                self.land_detected_started_ns = now_ns
+            self.land_detected_count += 1
+        else:
+            self.land_detected_started_ns = None
+            self.land_detected_count = 0
 
     def _on_vehicle_status(self, message):
         self.vehicle_status = message
@@ -578,9 +682,29 @@ class LemniscateMissionTest(Node):
         self.aborted = True
         self.get_logger().error(f'LEMNISCATE_ABORT {reason}; controlled landing')
         if self.local_position is not None:
-            self.setpoint = self.local_position[0].copy()
+            position, velocity = self.local_position
+            self.setpoint = position.copy()
             self.setpoint_velocity.fill(0.0)
-            self.origin[:2] = self.local_position[0][:2]
+            self.origin[:2] = position[:2]
+            horizontal_speed = float(np.linalg.norm(velocity[:2]))
+            if (self.phase in ('entry', 'track', 'exit')
+                    and self._is_armed_offboard()
+                    and horizontal_speed > 1.0):
+                target_z = min(
+                    position[2], self.origin[2] - self.takeoff_height)
+                climb = position[2] - target_z
+                self.abort_brake_duration_s = max(
+                    2.0,
+                    1.875 * horizontal_speed
+                    / self.posttrack_braking_acceleration,
+                    1.875 * climb / 0.60,
+                )
+                self.abort_brake_started_ns = now_ns
+                self.abort_brake_position = position.copy()
+                self.abort_brake_velocity = velocity.copy()
+                self.abort_brake_target_z = target_z
+                self._set_phase('abort_brake', now_ns)
+                return
         self._set_phase('land', now_ns)
 
     def _start_exit_braking(self, now_ns):
@@ -655,6 +779,7 @@ class LemniscateMissionTest(Node):
             'aborted': self.aborted,
             'speed_m_s': self.speed,
             'lap_time_s': self.lap_time,
+            'reference_rate_hz': self.reference_rate_hz,
             'laps': self.laps,
             'takeoff_height_m': self.takeoff_height,
             'scale_m': self.trajectory.scale,
@@ -676,7 +801,7 @@ class LemniscateMissionTest(Node):
     def _tick(self):
         now_ns = self.get_clock().now().nanoseconds
         if self.last_tick_ns is None:
-            dt = 0.05
+            dt = 1.0 / self.reference_rate_hz
         else:
             dt = float(np.clip(
                 (now_ns - self.last_tick_ns) * 1e-9, 0.001, 0.20))
@@ -735,6 +860,15 @@ class LemniscateMissionTest(Node):
         if violation is not None:
             self._abort_to_land(violation, now_ns)
 
+        if self.aborted and near_ground_runaway(
+                self.local_position[0], self.origin,
+                self.exit_horizontal_bound + self.horizontal_safety_margin):
+            self.get_logger().error(
+                'SITL near-ground runaway after abort; emergency disarm')
+            self.disarm_started_ns = now_ns
+            self._request_forced_disarm(now_ns)
+            return
+
         if self.phase == 'takeoff':
             target = self.origin + self.start_sample.position
             self.setpoint, self.setpoint_velocity = slew_setpoint_with_velocity(
@@ -778,6 +912,10 @@ class LemniscateMissionTest(Node):
 
         if self.phase == 'track':
             elapsed_s = (now_ns - self.track_started_ns) * 1e-9
+            if (self.test_abort_after_track_s > 0.0
+                    and elapsed_s >= self.test_abort_after_track_s):
+                self._abort_to_land('requested test abort', now_ns)
+                return
             if elapsed_s <= self.trajectory.total_duration:
                 reference = self._absolute_sample(
                     self.track_phase_offset_s + elapsed_s)
@@ -809,27 +947,48 @@ class LemniscateMissionTest(Node):
                 self._set_phase('land', now_ns)
             return
 
+        if self.phase == 'abort_brake':
+            elapsed_s = (now_ns - self.abort_brake_started_ns) * 1e-9
+            reference = abort_brake_sample(
+                self.abort_brake_position, self.abort_brake_velocity,
+                min(elapsed_s, self.abort_brake_duration_s),
+                self.abort_brake_duration_s, self.abort_brake_target_z)
+            if elapsed_s <= self.abort_brake_duration_s:
+                self._publish_sample(reference)
+            else:
+                self.setpoint = reference.position.copy()
+                self.setpoint_velocity.fill(0.0)
+                self.origin[:2] = reference.position[:2]
+                self._set_phase('land', now_ns)
+            return
+
         if self.phase == 'land':
             target = self.origin.copy()
+            position, velocity = self.local_position
+            if not landing_descent_allowed(position, velocity, self.setpoint):
+                target[2] = self.setpoint[2]
             self.setpoint, self.setpoint_velocity = slew_setpoint_with_velocity(
                 self.setpoint, target, dt,
                 self.staging_horizontal_speed, self.descent_speed)
             self._publish_hold_or_slew(
                 self.setpoint,
                 self.setpoint_velocity,
-                tracking_feedback=self.aborted,
+                tracking_feedback=False,
             )
-            position, velocity = self.local_position
-            if (position[2] >= self.origin[2] - 0.20
-                    and float(np.linalg.norm(velocity)) <= 0.60):
+            landed_confirmed = landed_state_confirmed(
+                self.land_detected_count, self.land_detected_started_ns,
+                self.land_detected_arrival_ns, now_ns)
+            if landing_disarm_allowed(
+                    position, velocity, self.origin, landed_confirmed):
                 self.disarm_started_ns = now_ns
                 self._request_forced_disarm(now_ns)
                 return
-            if (now_ns - self.phase_started_ns) * 1e-9 > self.land_timeout_s:
+            if ((now_ns - self.phase_started_ns) * 1e-9 > self.land_timeout_s
+                    and not self.land_timeout_reported):
                 self.aborted = True
-                self.get_logger().error('Landing phase timed out')
-                self.disarm_started_ns = now_ns
-                self._request_forced_disarm(now_ns)
+                self.land_timeout_reported = True
+                self.get_logger().error(
+                    'Landing timed out above ground; holding offboard control')
 
 
 def main(args=None):
