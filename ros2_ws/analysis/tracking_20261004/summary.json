@@ -1,0 +1,45 @@
+{
+  "bag": "/home/zr/PX4-PhoenixDrone-ROS2/ros2_ws/analysis/tracking_20261004/bag",
+  "mission": {
+    "aborted": false,
+    "exit_horizontal_bound_m": 11.081449596107907,
+    "horizontal_bound_m": 11.081449596107907,
+    "lap_time_s": 7.0,
+    "laps": 3,
+    "passed": true,
+    "position_max_ned_m": [
+      2.6444857120513916,
+      3.36938738822937,
+      -0.011173868551850319
+    ],
+    "position_min_ned_m": [
+      -10.81735610961914,
+      -5.372897624969482,
+      -2.0239124298095703
+    ],
+    "reference_rate_hz": 20.0,
+    "scale_m": 6.674147930640862,
+    "speed_m_s": 5.0,
+    "speed_peak_m_s": 5.461695714465566,
+    "takeoff_height_m": 2.0,
+    "track_passed": true,
+    "track_peak_error_m": 1.9639408874341828,
+    "track_rms_error_m": 0.7534189127075581,
+    "track_sample_count": 419
+  },
+  "tracking_duration_s": 21.00886821746826,
+  "position_samples": 10407,
+  "attitude_samples": 10407,
+  "position_axis_rmse_m": [
+    0.40905421588577073,
+    0.6605765554970691,
+    0.25277140371706697
+  ],
+  "position_rmse_m": 0.8170557629338624,
+  "position_peak_m": 2.120530762734019,
+  "tracking_speed_peak_m_s": 5.461695714465566,
+  "attitude_geodesic_rmse_deg": 6.103699997352533,
+  "position_error_convention": "actual minus reference, NED",
+  "attitude_convention": "TS-to-NED intrinsic ZXY, yaw/roll/pitch; plot order roll/pitch/yaw",
+  "source": "New 2026-10-04 headless SITL run; PX4 estimates, not Gazebo ground truth"
+}

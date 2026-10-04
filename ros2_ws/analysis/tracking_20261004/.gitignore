@@ -1,0 +1,6 @@
+# Keep published plots and summaries small; retain raw capture data locally.
+bag/
+ros_logs/
+*.log
+*.csv
+*.npz
