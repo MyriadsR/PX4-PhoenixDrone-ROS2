@@ -54,6 +54,9 @@ class AlphaTailsitterController(TailsitterController):
         self.flap_angle_without_transient = np.zeros(2)
         self.alpha_debug_publisher = self.create_publisher(
             Float64MultiArray, '/phoenix_tailsitter/alpha_model_debug', 10)
+        # Same-cycle current/reference TS-to-NED quaternions [w, x, y, z].
+        self.attitude_tracking_publisher = self.create_publisher(
+            Float64MultiArray, '/phoenix_tailsitter/attitude_tracking_debug', 10)
         self.get_logger().warning(
             'Full alpha-theory controller selected; aerodynamic IDENTIFY '
             'defaults are provisional PhoenixDrone starting values.')
@@ -436,6 +439,10 @@ class AlphaTailsitterController(TailsitterController):
             model_result.moment_body_ts, dt)
 
         desired_q_ts, total_thrust, desired_rates_ts = desired
+        attitude_tracking = Float64MultiArray()
+        attitude_tracking.data = np.concatenate(
+            (q_current_ts, desired_q_ts)).tolist()
+        self.attitude_tracking_publisher.publish(attitude_tracking)
         tracking = (
             source == 'trajectory'
             and self.trajectory_setpoint is not None
