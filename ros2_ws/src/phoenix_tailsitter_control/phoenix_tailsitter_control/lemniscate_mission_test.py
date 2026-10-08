@@ -458,15 +458,15 @@ class LemniscateMissionTest(Node):
         if (not math.isfinite(self.test_abort_after_track_s)
                 or self.test_abort_after_track_s < 0.0):
             raise ValueError('test_abort_after_track_s must be finite and nonnegative')
-        if self.speed > 8.0:
-            raise ValueError('speed_m_s is limited to <= 8.0 for this SITL test')
+        if self.speed > self._maximum_reference_speed():
+            raise ValueError('speed_m_s exceeds this SITL mission limit')
         if self.takeoff_height > 12.0:
             raise ValueError('takeoff_height_m is limited to <= 12.0 for this SITL test')
 
-        self.trajectory = BernoulliLemniscateTrajectory(
-            self.speed, self.lap_time, self.laps, self.takeoff_height)
+        self.trajectory = self._make_trajectory()
         self.start_sample = self.trajectory.sample(0.0)
-        self.track_phase_offset_s = 0.5 * self.entry_duration_s
+        self.track_phase_offset_s = getattr(
+            self.trajectory, 'track_phase_offset_s', 0.5 * self.entry_duration_s)
         self.track_end_phase_s = (
             self.track_phase_offset_s + self.trajectory.total_duration)
         self.final_sample = self.trajectory.sample(self.track_end_phase_s)
@@ -529,9 +529,16 @@ class LemniscateMissionTest(Node):
             self._on_vehicle_status, PX4_OUTPUT_QOS)
         self.create_timer(1.0 / self.reference_rate_hz, self._tick)
         self.get_logger().warning(
-            'Prepared automated Bernoulli lemniscate mission: '
+            f'Prepared automated {getattr(self.trajectory, "name", "Bernoulli lemniscate")} mission: '
             f'speed={self.speed:.2f} m/s, lap_time={self.lap_time:.1f} s, '
             f'laps={self.laps}, scale={self.trajectory.scale:.3f} m')
+
+    def _maximum_reference_speed(self):
+        return 8.0
+
+    def _make_trajectory(self):
+        return BernoulliLemniscateTrajectory(
+            self.speed, self.lap_time, self.laps, self.takeoff_height)
 
     def _on_local_position(self, message):
         position = np.array([message.x, message.y, message.z], dtype=float)

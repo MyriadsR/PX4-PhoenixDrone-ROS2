@@ -33,5 +33,7 @@ setup(
         'phoenix_tailsitter_control.position_mission_test:main',
         'lemniscate_mission_test = '
         'phoenix_tailsitter_control.lemniscate_mission_test:main',
+        'paper_trajectory_mission = '
+        'phoenix_tailsitter_control.paper_trajectory_mission:main',
     ]},
 )
