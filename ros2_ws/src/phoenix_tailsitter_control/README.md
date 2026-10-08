@@ -242,7 +242,8 @@ ros2 launch phoenix_tailsitter_control tailsitter_alpha_sitl.launch.py \
 辨识参数的控制端默认值集中在 `config.py` 的
 `alpha_identification_defaults`，仿真端对应值位于
 `models/phoenixdrone_alpha/model.sdf` 的 `TailsitterAlphaAero` 插件块。两处必须成对
-更新，禁止只修改控制器或只修改 Gazebo。当前默认值如下：
+更新，禁止只修改控制器或只修改 Gazebo。2026-08-27 首轮默认值如下（历史记录，
+当前模型参数以 `config.py` 和对应 SDF 为准）：
 
 | 参数 | 默认值 | 默认值来源/处理 |
 |---|---:|---|
@@ -270,6 +271,78 @@ ros2 launch phoenix_tailsitter_control tailsitter_alpha_sitl.launch.py \
 角速度峰值低于 `8e-4 rad/s`，没有出现坐标或通道符号错误造成的快速翻转。该测试
 只验证首轮模型链路和静态方向，不代表这些默认气动参数已经辨识，也不代表过渡飞行
 已经验收。
+
+## 2026-10-04 轨迹参考与振荡修正
+
+alpha 路径默认启用 `trajectory_prediction_enabled`、
+`motion_gain_scheduling_enabled`、`use_measured_control_dt`、
+`world_force_filter_enabled` 和 `transport_feedforward_rates_enabled`。参考发布仍为
+20 Hz；控制器依据同钟消息时间戳，用 p/v/a/jerk 多项式以及 yaw/yawspeed
+推进到当前控制时刻，最大推进 0.10 s。时间戳缺失或来自另一时钟域时，使用本地
+接收时刻；原始 NaN 控制 mask 保留，位置保持与加速度单独控制的语义保持一致。
+
+机动权重由请求的速度、加速度和偏航角速度连续决定，有限的零加速度不再自动
+启用高机动增益。位置环、姿态环和反馈加速度边界使用同一个缓变权重。
+NaN 加速度的起飞/降落准备使用原低速参数；有限静止轨迹使用独立的悬停参数，
+以保留从运动中制动的能力。具体数值见 `config.py` 的
+`trajectory_hover_*`、`maneuver_*`。实测控制周期用于滤波、差分与增益过渡，
+避免将非实时 ROS 回调固定解释为 2 ms。
+
+线加速度 INDI 使用完整瞬时模型力：用选定的实际/预测执行器状态和当前速度计算，
+旋转到 NED 后再低通，截止和 dt 与测量加速度一致。瞬态舵力在相同世界系独立
+滤波；在稳态力与加速度中同时扣除，保持总力平衡。旧路径仅滤波执行器输入、
+再使用当前姿态旋转，会在旋转运动中产生额外相位误差。
+
+平坦性角速度前馈属于名义参考姿态的 TS 机体系，现在通过
+`R_current.T @ R_reference @ omega_reference` 转到当前 TS 机体系，再与测量角速度
+比较。姿态误差反馈仍追踪位置闭环修正后的目标姿态。
+
+`reference_debug` 的八个值依次为预测年龄 s、发布/接收是否同钟、是否启用预测、
+运动权重目标、已应用权重、是否启用运动调度、是否启用世界系模型力滤波、
+是否启用角速度前馈坐标转换。完整回归还记录 `timing_debug`、原始角速度、
+`actuator_feedback_debug` 和原始关节反馈。五个开关可独立设为 `false`，用于
+控制变量对照；alpha 路径力/加速度滤波截止仍为统一 15 Hz。
+
+分段轨迹自身包含地面起飞，因此 `paper_trajectory_mission` 在确认 armed/offboard
+后直接开始它的 t=0，避免在地面零运动参考下额外等待。原轨迹源码快照、正式
+时长、速度、圈数与固定位置平移均保留。对照用同一连续解析参考计分，避免把
+改变误差采样方式误判为真实改善。记录、源码快照与报告位于
+`ros2_ws/analysis/tracking_improvement_20261004/`。其中 `final/` 是增益/周期修正的
+中间候选；`rate_transport/` 记录上述五项全部启用的最新配置。
+
+## 刀刃过渡与掉头的独立 SITL 配置
+
+`tailsitter_alpha_sitl.launch.py` 新增 `maneuver_profile`，默认 `standard` 保留
+本次修改前的控制器行为。可选的改善配置为 `knife-edge-transition` 和 `differential-turn`；
+刀刃配置限制起飞补偿的工作高度，并匹配角加速度 INDI 两侧的力矩滤波。
+刀刃过渡另外按机动权重提高角加速度/力矩软件限幅至原值的 4/4 倍；
+执行器物理边界、悬停增益、气动参数和轨迹正式速度/时长保持原值。
+掉头配置保留 7 m/s、1.6 s 速度反向和 0.52 s 偏航翻转，只将偏航翻转中心
+移到速度过零点。机动角加速度/力矩软件限幅提高至 8/8 倍，姿态带宽按 1.25
+倍调度（姿态增益乘 1.25²，角速度增益乘 1.25）。额外带宽只作用于有明确
+加速度参考的机动；普通保持、降落使用原控制器。物理电机/舵限幅保持原值。
+掉头任务同时设置 `differential_yaw_centered:=true`；默认关闭，原偏航可复现。
+原轨迹快照不修改，变体放在 `trajectory_variants.py`。
+
+刀刃过渡任务需要同时设置 `knife_entry_straight:=true`，在正式计分前沿起点
+切线加速，避免先进入上一圈的过弯姿态。该参数默认关闭，原入轨方式可复现。
+正式 50 秒、8 圈的原始轨迹以及所有导数保持不变，仅世界位置平移随准备路径变化。
+
+自动测试脚本为刀刃过渡和掉头分别选择上述配置及任务参数，其他轨迹使用原配置：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ros2_ws/install/setup.bash
+python3 ros2_ws/analysis/run_paper_trajectory_suite.py \
+  --output-dir /tmp/phoenix_maneuver_retest \
+  --trajectories knife-edge-transition differential-turn
+```
+
+加 `--baseline-controller` 可直接使用修改前的控制器和准备方式进行对照。
+逐次试验的源码快照、原始 rosbag、四类结果图和回退备份位于
+`ros2_ws/analysis/maneuver_improvement_20261004/` 和
+`ros2_ws/analysis/differential_improvement_20261008/`。以相应报告为准，
+完成整段轨迹与达到高精度跟踪分别评价；未通过的配置不作为默认配置。
 
 ## 本阶段停止条件
 
