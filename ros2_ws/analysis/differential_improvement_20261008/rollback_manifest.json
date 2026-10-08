@@ -1,0 +1,51 @@
+[
+  {
+    "path": "/home/zr/PX4-PhoenixDrone-ROS2/ros2_ws/src/phoenix_tailsitter_control/phoenix_tailsitter_control/alpha_controller_node.py",
+    "relative_path": "phoenix_tailsitter_control/alpha_controller_node.py",
+    "existed": true,
+    "before_sha256": "d32bbdc30ed279e45c84c8027f8040efd88f3abbaf9c755f12d38ca13cd89120",
+    "retained_sha256": "5645b1a41fa80073c2ed266381160c95c56931de5e4f203b1df449016a5a908f"
+  },
+  {
+    "path": "/home/zr/PX4-PhoenixDrone-ROS2/ros2_ws/src/phoenix_tailsitter_control/phoenix_tailsitter_control/maneuver_profiles.py",
+    "relative_path": "phoenix_tailsitter_control/maneuver_profiles.py",
+    "existed": true,
+    "before_sha256": "39261a7fd12ad27cd474484951a70d97fdc45b2808ce827f1167545882e1b0e0",
+    "retained_sha256": "2aa895d66fa8745c342b80ca10c7bbb00440d79897cbcf3336daecff4feb032d"
+  },
+  {
+    "path": "/home/zr/PX4-PhoenixDrone-ROS2/ros2_ws/src/phoenix_tailsitter_control/phoenix_tailsitter_control/paper_trajectory_mission.py",
+    "relative_path": "phoenix_tailsitter_control/paper_trajectory_mission.py",
+    "existed": true,
+    "before_sha256": "b9572ea065e50a0f2988a5d48fb23adda1a1214b27607f633992ae5e360503ac",
+    "retained_sha256": "c124d20f05410711058c4dcd34dd8d731a2415980b57d3562241bad0ea0a58ad"
+  },
+  {
+    "path": "/home/zr/PX4-PhoenixDrone-ROS2/ros2_ws/src/phoenix_tailsitter_control/phoenix_tailsitter_control/trajectory_variants.py",
+    "relative_path": "phoenix_tailsitter_control/trajectory_variants.py",
+    "existed": false,
+    "before_sha256": null,
+    "retained_sha256": "dd622dd36f93a06721760f63e62c3663324f24c0299254a1934ad750362a2333"
+  },
+  {
+    "path": "/home/zr/PX4-PhoenixDrone-ROS2/ros2_ws/src/phoenix_tailsitter_control/launch/tailsitter_alpha_sitl.launch.py",
+    "relative_path": "launch/tailsitter_alpha_sitl.launch.py",
+    "existed": true,
+    "before_sha256": "7532fdc176ed8f09c44b8becfb74c9b9956bd654a1417f502cac3f629a777738",
+    "retained_sha256": "1856a5dd813c0a6ec0288c5ff2669350d2624d660f95de2ff8ccc674ea8ddeeb"
+  },
+  {
+    "path": "/home/zr/PX4-PhoenixDrone-ROS2/ros2_ws/src/phoenix_tailsitter_control/test/test_differential_variant.py",
+    "relative_path": "test/test_differential_variant.py",
+    "existed": false,
+    "before_sha256": null,
+    "retained_sha256": "7eed5b8b2f257552cffa101a7c37e0fdd2ad78cc4ba0629dcb81a1cc129276c1"
+  },
+  {
+    "path": "/home/zr/PX4-PhoenixDrone-ROS2/ros2_ws/src/phoenix_tailsitter_control/README.md",
+    "relative_path": "README.md",
+    "existed": true,
+    "before_sha256": "2b18c168ee2b2b0d22797973bf4848b238e39afa93479cb4c58006b7fcf0c0bd",
+    "retained_sha256": "75f6fa6d76f776a1c7f12937adf3bab7990a3c2544570f99e0487cfe664933c1"
+  }
+]

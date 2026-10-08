@@ -1,0 +1,68 @@
+[
+  {
+    "target": "ros2_ws/src/phoenix_tailsitter_control/README.md",
+    "backup": "baseline_source/README.md",
+    "baseline_sha256": "251e03c39c2edb0e3c7510fe81d5f2fcc0169a162aee0b2489ae7ae9e4e2ebac",
+    "final_sha256": "2b18c168ee2b2b0d22797973bf4848b238e39afa93479cb4c58006b7fcf0c0bd"
+  },
+  {
+    "target": "ros2_ws/src/phoenix_tailsitter_control/launch/tailsitter_alpha_sitl.launch.py",
+    "backup": "baseline_source/launch/tailsitter_alpha_sitl.launch.py",
+    "baseline_sha256": "e62cee0a782f23759919798429a5af1230bd52fa5a30e0e9ab47761408e77942",
+    "final_sha256": "7532fdc176ed8f09c44b8becfb74c9b9956bd654a1417f502cac3f629a777738"
+  },
+  {
+    "target": "ros2_ws/src/phoenix_tailsitter_control/phoenix_tailsitter_control/alpha_controller_node.py",
+    "backup": "baseline_source/phoenix_tailsitter_control/alpha_controller_node.py",
+    "baseline_sha256": "11c186d488a3a195abbc9f2797d2b8a84269cceeae877bbd85bc3120da82431f",
+    "final_sha256": "d32bbdc30ed279e45c84c8027f8040efd88f3abbaf9c755f12d38ca13cd89120"
+  },
+  {
+    "target": "ros2_ws/src/phoenix_tailsitter_control/phoenix_tailsitter_control/attitude_control.py",
+    "backup": "baseline_source/phoenix_tailsitter_control/attitude_control.py",
+    "baseline_sha256": "7306e6531c472f50a69d7e933877ae1b23fadb1181dd60bb1a5a4f69602c8d6b",
+    "final_sha256": "8d023f9c0524037677f5ae67561c2500531c240afe5e1cf23e91ae7db5c8dcc2"
+  },
+  {
+    "target": "ros2_ws/src/phoenix_tailsitter_control/phoenix_tailsitter_control/position_control.py",
+    "backup": "baseline_source/phoenix_tailsitter_control/position_control.py",
+    "baseline_sha256": "4ea1625ea713f4f55c5a2da51cdfd249536e8a96f7e1c0cd90716c0ee0e8b2ef",
+    "final_sha256": "b8cd9e61f13cae3d96859f55cc9306cbb59f1a4cf0f0a4c5203799632af34b41"
+  },
+  {
+    "target": "ros2_ws/src/phoenix_tailsitter_control/phoenix_tailsitter_control/paper_trajectory_mission.py",
+    "backup": "baseline_source/phoenix_tailsitter_control/paper_trajectory_mission.py",
+    "baseline_sha256": "263d6f77b3ee9423c92929d21e42af474572ece55960a8e3111c9f143b40c591",
+    "final_sha256": "b9572ea065e50a0f2988a5d48fb23adda1a1214b27607f633992ae5e360503ac"
+  },
+  {
+    "target": "ros2_ws/src/phoenix_tailsitter_control/phoenix_tailsitter_control/maneuver_profiles.py",
+    "backup": null,
+    "baseline_sha256": null,
+    "final_sha256": "39261a7fd12ad27cd474484951a70d97fdc45b2808ce827f1167545882e1b0e0"
+  },
+  {
+    "target": "ros2_ws/src/phoenix_tailsitter_control/test/test_position_control.py",
+    "backup": "baseline_source/test/test_position_control.py",
+    "baseline_sha256": "8d37d58fb4a949758701d62f843550eb5daa5df09304349c756e0ee2e57d9d23",
+    "final_sha256": "b24ebb5172d74160f85c90bb4404f9f84a64696184047fe49697059d10385e27"
+  },
+  {
+    "target": "ros2_ws/src/phoenix_tailsitter_control/test/test_paper_trajectories.py",
+    "backup": "baseline_source/test/test_paper_trajectories.py",
+    "baseline_sha256": "b6918aa5d0f6c8361c286d2bcf211dadafc4b2ba9ed10acf5b4f69255f9ee79d",
+    "final_sha256": "65e342ffeea0afbd2cec6cbecee40decabff50a2e2c459752d58d184ac3ce7b5"
+  },
+  {
+    "target": "ros2_ws/analysis/run_paper_trajectory_suite.py",
+    "backup": "baseline_source/run_paper_trajectory_suite.py",
+    "baseline_sha256": "a37fbde5c08424b10d04ae05338d152a9e60621ac0afcf726e1ea936e62c2ee3",
+    "final_sha256": "08eb55e0bd2838f8d26b7e3e80a3688cc97185cb474f50124db4ed225d2823bd"
+  },
+  {
+    "target": "ros2_ws/analysis/summarize_paper_suite.py",
+    "backup": "baseline_source/summarize_paper_suite.py",
+    "baseline_sha256": "f3628b24e9aee52a14b6a88ebd25020fe744dbfe8e80643be644b9ccf6293157",
+    "final_sha256": "e18e2a480cc535125b628fe9313d5db268b1217905361c44b950b708262a83e4"
+  }
+]

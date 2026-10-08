@@ -122,14 +122,15 @@ def plot_attitude(axes, att, actual, reference, lap_time, duration):
     axes[-1].set_xlabel('Tracking time (s)')
 
 
-def plot_3d(axis, p, height):
+def plot_3d(axis, p, height, origin_down=None):
     # Keep x/y relative to the first tracking reference, with altitude above takeoff.
     origin_xy = p[0, 4:6]
     actual = p[:, 1:4].copy()
     reference = p[:, 4:7].copy()
     actual[:, :2] -= origin_xy
     reference[:, :2] -= origin_xy
-    origin_down = p[0, 6] + height
+    if origin_down is None:
+        origin_down = p[0, 6] + height
     actual[:, 2] = origin_down - actual[:, 2]
     reference[:, 2] = origin_down - reference[:, 2]
     axis.plot(*actual.T, color=ACTUAL, label='PX4 estimate', linewidth=1.1)
@@ -156,10 +157,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--bag', type=Path, required=True)
     parser.add_argument('--output-dir', type=Path, required=True)
+    parser.add_argument('--cached-samples', action='store_true',
+                        help='Regenerate figures from this directory\'s verified summary/NPZ')
     args = parser.parse_args()
     out = args.output_dir
     out.mkdir(parents=True, exist_ok=True)
-    p, att, mission, duration = read_tracking(args.bag)
+    if args.cached_samples:
+        stored = json.loads((out / 'summary.json').read_text())
+        if Path(stored['bag']).resolve() != args.bag.resolve():
+            raise ValueError('Cached summary belongs to a different bag')
+        samples = np.load(out / 'tracking_samples.npz')
+        p, att = samples['position_debug'], samples['attitude_debug']
+        mission, duration = stored['mission'], stored['tracking_duration_s']
+    else:
+        p, att, mission, duration = read_tracking(args.bag)
     if mission is None:
         raise ValueError('Missing mission result; no verified metadata')
     actual_angles, reference_angles = euler_pairs(att)
@@ -168,7 +179,13 @@ def main():
                          'axes.titleweight': 'semibold', 'axes.labelcolor': '#364453',
                          'text.color': '#253445', 'axes.edgecolor': '#B9C2CB',
                          'svg.fonttype': 'none'})
-    title = f"Phoenix tailsitter | {mission['speed_m_s']:g} m/s | {mission['laps']} laps | tracking phase"
+    trajectory_name = mission.get('trajectory_name', 'lemniscate')
+    coverage = min(1.0, duration / mission.get(
+        'reference_duration_s', mission['lap_time_s'] * mission['laps']))
+    status = 'ABORTED' if mission.get('aborted') else 'COMPLETED'
+    title = (f"Phoenix tailsitter | {trajectory_name} | {mission['speed_m_s']:g} m/s | tracking phase\n"
+             f"{status} | coverage {coverage:.1%} of original {mission['laps']} planned laps")
+    origin_down = mission.get('takeoff_origin_ned_m', [None, None, None])[2]
     fig, axes = plt.subplots(3, 1, figsize=(11, 7.5), sharex=True, layout='constrained')
     fig.suptitle(title, fontsize=14)
     plot_errors(axes, p, lap_time, duration)
@@ -183,7 +200,7 @@ def main():
     save(fig, out, 'attitude_tracking')
     fig = plt.figure(figsize=(10, 8), layout='constrained')
     fig.suptitle(title, fontsize=14)
-    plot_3d(fig.add_subplot(projection='3d'), p, mission['takeoff_height_m'])
+    plot_3d(fig.add_subplot(projection='3d'), p, mission['takeoff_height_m'], origin_down)
     save(fig, out, 'trajectory_3d')
     fig = plt.figure(figsize=(16, 12.5), layout='constrained')
     grid = fig.add_gridspec(2, 2, height_ratios=[1.5, 1.2])
@@ -192,7 +209,7 @@ def main():
     plot_errors([fig.add_subplot(left[i]) for i in range(3)], p, lap_time, duration)
     plot_attitude([fig.add_subplot(right[i]) for i in range(3)], att, actual_angles, reference_angles, lap_time, duration)
     plot_speed(fig.add_subplot(grid[1, 0]), p, lap_time, duration)
-    plot_3d(fig.add_subplot(grid[1, 1], projection='3d'), p, mission['takeoff_height_m'])
+    plot_3d(fig.add_subplot(grid[1, 1], projection='3d'), p, mission['takeoff_height_m'], origin_down)
     fig.suptitle(title + '\nPosition and velocity: PX4 estimates | Attitude: same-cycle actual/controller target', fontsize=15)
     save(fig, out, 'tracking_overview')
     error = p[:, 1:4] - p[:, 4:7]
@@ -204,11 +221,16 @@ def main():
                'position_axis_rmse_m': np.sqrt(np.mean(error ** 2, axis=0)).tolist(),
                'position_rmse_m': float(np.sqrt(np.mean(np.sum(error ** 2, axis=1)))),
                'position_peak_m': float(np.max(np.linalg.norm(error, axis=1))),
+               'position_mean_error_ned_m': np.mean(error, axis=0).tolist(),
+               'velocity_magnitude_rmse_m_s': float(np.sqrt(np.mean((np.linalg.norm(p[:, 7:10], axis=1) - np.linalg.norm(p[:, 10:13], axis=1)) ** 2))),
+               'velocity_vector_rmse_m_s': float(np.sqrt(np.mean(np.sum((p[:, 7:10] - p[:, 10:13]) ** 2, axis=1)))),
                'tracking_speed_peak_m_s': float(np.max(np.linalg.norm(p[:, 7:10], axis=1))),
                'attitude_geodesic_rmse_deg': float(np.sqrt(np.mean(rotation_error_deg ** 2))),
+               'attitude_geodesic_peak_deg': float(np.max(rotation_error_deg)),
+               'tracking_coverage_fraction': coverage,
                'position_error_convention': 'actual minus reference, NED',
                'attitude_convention': 'TS-to-NED intrinsic ZXY, yaw/roll/pitch; plot order roll/pitch/yaw',
-               'source': 'New 2026-10-04 headless SITL run; PX4 estimates, not Gazebo ground truth'}
+               'source': 'Headless SITL run; PX4 estimates, not Gazebo ground truth'}
     (out / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     np.savez_compressed(out / 'tracking_samples.npz', position_debug=p, attitude_debug=att,
                         actual_euler_deg=actual_angles, reference_euler_deg=reference_angles)
