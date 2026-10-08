@@ -63,6 +63,11 @@ class PhoenixHoverConfig:
     control_rate_hz: float = 500.0
     indi_lpf_cutoff_hz: float = 15.0
     linear_indi_lpf_cutoff_hz: float = 5.0
+    trajectory_prediction_horizon_s: float = 0.10
+    maneuver_speed_threshold: float = 0.50
+    maneuver_acceleration_threshold: float = 0.50
+    maneuver_yaw_rate_threshold: float = 0.30
+    maneuver_gain_transition_s: float = 1.0
     state_timeout_s: float = 0.10
     # PX4 publishes vehicle_control_mode every 0.5 s; allow transport jitter
     # without briefly zeroing both motors between otherwise healthy updates.
@@ -74,11 +79,17 @@ class PhoenixHoverConfig:
     # actuator chain during the ground-to-flight transient.
     attitude_gain: np.ndarray = field(default_factory=lambda: np.array([6.0, 6.0, 6.0]))
     rate_gain: np.ndarray = field(default_factory=lambda: np.array([3.0, 3.0, 3.0]))
-    # Transition to maneuver gains only with explicit acceleration references.
+    # Alpha trajectory control schedules these gains by requested motion.
     tracking_attitude_gain: np.ndarray = field(
         default_factory=lambda: np.array([78.4, 54.88, 54.88]))
     tracking_rate_gain: np.ndarray = field(
         default_factory=lambda: np.array([14.0, 9.8, 9.8]))
+    # Finite stationary trajectory references need enough attitude bandwidth
+    # to brake out of a maneuver, without the saturated high-gain hover cycle.
+    trajectory_hover_attitude_gain: np.ndarray = field(
+        default_factory=lambda: np.array([24.0, 16.0, 16.0]))
+    trajectory_hover_rate_gain: np.ndarray = field(
+        default_factory=lambda: np.array([8.0, 6.0, 6.0]))
     angular_acceleration_limit: np.ndarray = field(
         default_factory=lambda: np.array([20.0, 15.0, 24.0]))
     moment_limit: np.ndarray = field(default_factory=lambda: np.array([0.25, 0.08, 0.35]))
@@ -91,9 +102,8 @@ class PhoenixHoverConfig:
         default_factory=lambda: np.array([4.0, 1.0, 1.5]))
     velocity_gain: np.ndarray = field(
         default_factory=lambda: np.array([3.0, 3.0, 3.0]))
-    # Finite acceleration feed-forward identifies maneuvering references.  Use
-    # more velocity damping there without changing the proven takeoff/landing
-    # gains used by position-only staging setpoints.
+    # Use more velocity damping on moving trajectories; stationary references
+    # use the staging gains even if their acceleration fields are finite zeros.
     tracking_position_gain: np.ndarray = field(
         default_factory=lambda: np.array([4.0, 2.0, 3.0]))
     tracking_velocity_gain: np.ndarray = field(
@@ -113,6 +123,8 @@ class PhoenixHoverConfig:
     # closed-loop SITL testing.
     tracking_horizontal_acceleration_limit: float = 3.00
     tracking_vertical_acceleration_limit: float = 1.50
+    trajectory_hover_horizontal_acceleration_limit: float = 1.20
+    trajectory_hover_vertical_acceleration_limit: float = 1.00
     position_tilt_limit_rad: float = float(np.deg2rad(89.0))
     horizontal_force_slew_rate_n_s: float = 1.0e6
     minimum_position_thrust_scale: float = 0.0

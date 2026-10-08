@@ -201,6 +201,19 @@ def test_takeoff_force_floor_keeps_airborne_indi_force_when_estimate_is_valid():
     np.testing.assert_allclose(result, force)
 
 
+def test_ground_only_takeoff_floor_preserves_airborne_maneuver_force_with_low_lift():
+    cfg = PhoenixHoverConfig()
+    position = np.array([0.0, 0.0, -9.5])
+    reference = resolve_trajectory_reference(
+        trajectory([0.0, 0.0, -10.0], [0.0, 6.0, 0.0], [0.0, -12.0, 0.0]),
+        position, np.zeros(3), 0.0)
+    force = np.array([2.0, -8.4, -4.0])
+    result = apply_takeoff_force_floor(
+        force, [0.0, -8.4, -8.0], [0.0, 0.0, -3.0], position,
+        reference, cfg, ground_only=True)
+    np.testing.assert_allclose(result, force)
+
+
 def test_force_estimate_uses_ts_axes_and_phoenix_aero_force_directions():
     cfg = PhoenixHoverConfig()
     controller = LinearAccelerationINDIController(cfg)

@@ -8,6 +8,7 @@ from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+from phoenix_tailsitter_control.maneuver_profiles import CONTROLLER_PROFILES
 
 
 PX4_ROOT = Path('/home/zr/PX4-PhoenixDrone-ROS2')
@@ -22,6 +23,11 @@ FEEDBACK_TOPIC = f'/world/stars_ts/model/{MODEL_NAME}/joint_state'
 
 
 def generate_launch_description():
+    maneuver_profile = LaunchConfiguration('maneuver_profile')
+    def profile_default(key):
+        values = {name: str(params[key]).lower()
+                  for name, params in CONTROLLER_PROFILES.items()}
+        return PythonExpression([repr(values), "['", maneuver_profile, "']"])
     headless = LaunchConfiguration('headless')
     controller_enabled = LaunchConfiguration('controller_enabled')
     output_enabled = LaunchConfiguration('output_enabled')
@@ -30,7 +36,19 @@ def generate_launch_description():
     feedback_enabled = LaunchConfiguration('feedback_enabled')
     actuator_feedback_mode = LaunchConfiguration('actuator_feedback_mode')
     use_measured_control_dt = LaunchConfiguration('use_measured_control_dt')
+    trajectory_prediction_enabled = LaunchConfiguration('trajectory_prediction_enabled')
+    motion_gain_scheduling_enabled = LaunchConfiguration('motion_gain_scheduling_enabled')
+    world_force_filter_enabled = LaunchConfiguration('world_force_filter_enabled')
+    transport_feedforward_rates_enabled = LaunchConfiguration('transport_feedforward_rates_enabled')
+    ground_only_takeoff_force_floor = LaunchConfiguration('ground_only_takeoff_force_floor')
+    maneuver_acceleration_limit_scale = LaunchConfiguration('maneuver_acceleration_limit_scale')
+    maneuver_moment_limit_scale = LaunchConfiguration('maneuver_moment_limit_scale')
+    matched_moment_filter_enabled = LaunchConfiguration('matched_moment_filter_enabled')
     return LaunchDescription([
+        DeclareLaunchArgument('maneuver_profile', default_value='standard',
+                              choices=list(CONTROLLER_PROFILES)),
+        DeclareLaunchArgument('maneuver_attitude_bandwidth_scale',
+                              default_value=profile_default('maneuver_attitude_bandwidth_scale')),
         DeclareLaunchArgument('headless', default_value='true'),
         DeclareLaunchArgument('controller_enabled', default_value='true'),
         DeclareLaunchArgument('output_enabled', default_value='false'),
@@ -38,7 +56,19 @@ def generate_launch_description():
         DeclareLaunchArgument('setpoint_frame', default_value='px4'),
         DeclareLaunchArgument('feedback_enabled', default_value='true'),
         DeclareLaunchArgument('actuator_feedback_mode', default_value='auto'),
-        DeclareLaunchArgument('use_measured_control_dt', default_value='false'),
+        DeclareLaunchArgument('use_measured_control_dt', default_value='true'),
+        DeclareLaunchArgument('trajectory_prediction_enabled', default_value='true'),
+        DeclareLaunchArgument('motion_gain_scheduling_enabled', default_value='true'),
+        DeclareLaunchArgument('world_force_filter_enabled', default_value='true'),
+        DeclareLaunchArgument('transport_feedforward_rates_enabled', default_value='true'),
+        DeclareLaunchArgument('ground_only_takeoff_force_floor',
+                              default_value=profile_default('ground_only_takeoff_force_floor')),
+        DeclareLaunchArgument('maneuver_acceleration_limit_scale',
+                              default_value=profile_default('maneuver_acceleration_limit_scale')),
+        DeclareLaunchArgument('maneuver_moment_limit_scale',
+                              default_value=profile_default('maneuver_moment_limit_scale')),
+        DeclareLaunchArgument('matched_moment_filter_enabled',
+                              default_value=profile_default('matched_moment_filter_enabled')),
         ExecuteProcess(
             cmd=[str(AGENT), 'udp4', '-p', '8888'],
             additional_env={
@@ -93,6 +123,8 @@ def generate_launch_description():
             package='phoenix_tailsitter_control',
             executable='alpha_tailsitter_controller',
             parameters=[{
+                'maneuver_attitude_bandwidth_scale': ParameterValue(
+                    LaunchConfiguration('maneuver_attitude_bandwidth_scale'), value_type=float),
                 'output_enabled': ParameterValue(
                     output_enabled, value_type=bool),
                 'setpoint_source': setpoint_source,
@@ -101,6 +133,22 @@ def generate_launch_description():
                 'actuator_feedback_topic': FEEDBACK_TOPIC,
                 'use_measured_control_dt': ParameterValue(
                     use_measured_control_dt, value_type=bool),
+                'trajectory_prediction_enabled': ParameterValue(
+                    trajectory_prediction_enabled, value_type=bool),
+                'motion_gain_scheduling_enabled': ParameterValue(
+                    motion_gain_scheduling_enabled, value_type=bool),
+                'world_force_filter_enabled': ParameterValue(
+                    world_force_filter_enabled, value_type=bool),
+                'transport_feedforward_rates_enabled': ParameterValue(
+                    transport_feedforward_rates_enabled, value_type=bool),
+                'ground_only_takeoff_force_floor': ParameterValue(
+                    ground_only_takeoff_force_floor, value_type=bool),
+                'maneuver_acceleration_limit_scale': ParameterValue(
+                    maneuver_acceleration_limit_scale, value_type=float),
+                'maneuver_moment_limit_scale': ParameterValue(
+                    maneuver_moment_limit_scale, value_type=float),
+                'matched_moment_filter_enabled': ParameterValue(
+                    matched_moment_filter_enabled, value_type=bool),
             }],
             condition=IfCondition(controller_enabled),
             output='screen',

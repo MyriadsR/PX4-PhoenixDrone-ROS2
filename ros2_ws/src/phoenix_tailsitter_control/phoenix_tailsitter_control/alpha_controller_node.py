@@ -9,6 +9,7 @@ from std_msgs.msg import Float64MultiArray
 
 from .alpha_aerodynamics import AlphaAerodynamics
 from .alpha_allocator import AlphaTheoryAllocator
+from .attitude_control import AttitudeINDIController, transport_reference_rates
 from .controller_node import TailsitterController
 from .debug import (
     pack_alpha_model_debug,
@@ -20,10 +21,14 @@ from .flatness_control import FlatnessAttitudeController
 from .frames import attitude_px4_to_ts, vector_px4_to_ts
 from .math_utils import quaternion_to_matrix, rotation_vector_error
 from .position_control import (
+    advance_trajectory_reference,
     apply_takeoff_force_floor,
     degraded_vertical_force,
     resolve_trajectory_reference,
+    maneuver_gain_target,
     tailsitter_heading_from_attitude,
+    trajectory_reference_age,
+    update_gain_blend,
 )
 
 
@@ -32,9 +37,42 @@ class AlphaTailsitterController(TailsitterController):
 
     def __init__(self):
         super().__init__()
-        self.declare_parameter('use_measured_control_dt', False)
+        self.declare_parameter('use_measured_control_dt', True)
         self.use_measured_control_dt = bool(
             self.get_parameter('use_measured_control_dt').value)
+        # Disable independently for recorded A/B comparisons with the old path.
+        self.declare_parameter('trajectory_prediction_enabled', True)
+        self.declare_parameter('motion_gain_scheduling_enabled', True)
+        self.declare_parameter('world_force_filter_enabled', True)
+        self.declare_parameter('transport_feedforward_rates_enabled', True)
+        self.declare_parameter('ground_only_takeoff_force_floor', False)
+        self.ground_only_takeoff_force_floor = bool(
+            self.get_parameter('ground_only_takeoff_force_floor').value)
+        self.declare_parameter('maneuver_acceleration_limit_scale', 1.0)
+        self.declare_parameter('maneuver_moment_limit_scale', 1.0)
+        self.maneuver_moment_limit_scale = float(
+            self.get_parameter('maneuver_moment_limit_scale').value)
+        self.declare_parameter('matched_moment_filter_enabled', False)
+        self.matched_moment_filter_enabled = bool(
+            self.get_parameter('matched_moment_filter_enabled').value)
+        self.maneuver_acceleration_limit_scale = float(
+            self.get_parameter('maneuver_acceleration_limit_scale').value)
+        if (not math.isfinite(self.maneuver_acceleration_limit_scale)
+                or self.maneuver_acceleration_limit_scale <= 0.0):
+            raise ValueError('maneuver_acceleration_limit_scale must be finite and positive')
+        if (not math.isfinite(self.maneuver_moment_limit_scale)
+                or self.maneuver_moment_limit_scale <= 0.0):
+            raise ValueError('maneuver_moment_limit_scale must be finite and positive')
+        self.trajectory_prediction_enabled = bool(
+            self.get_parameter('trajectory_prediction_enabled').value)
+        self.motion_gain_scheduling_enabled = bool(
+            self.get_parameter('motion_gain_scheduling_enabled').value)
+        self.world_force_filter_enabled = bool(
+            self.get_parameter('world_force_filter_enabled').value)
+        self.transport_feedforward_rates_enabled = bool(
+            self.get_parameter('transport_feedforward_rates_enabled').value)
+        self.motion_schedule_updated = False
+        self.reference_has_explicit_acceleration = False
         self.previous_control_ns = None
         self.tracking_gain_blend = 0.0
         self.filter_dt_s = 1.0 / self.cfg.control_rate_hz
@@ -44,6 +82,15 @@ class AlphaTailsitterController(TailsitterController):
             Float64MultiArray, '/phoenix_tailsitter/timing_debug', 10)
         self.aerodynamics = AlphaAerodynamics(self.cfg)
         self.allocator = AlphaTheoryAllocator(self.cfg)
+        self.declare_parameter('maneuver_attitude_bandwidth_scale', 1.0)
+        bandwidth = float(self.get_parameter('maneuver_attitude_bandwidth_scale').value)
+        if not math.isfinite(bandwidth) or bandwidth <= 0.0:
+            raise ValueError('maneuver attitude bandwidth scale must be finite and positive')
+        self.maneuver_controller = self.controller
+        if bandwidth != 1.0:
+            self.maneuver_controller = AttitudeINDIController(self.cfg)
+            self.maneuver_controller.tracking_attitude_gain = self.controller.tracking_attitude_gain * bandwidth**2
+            self.maneuver_controller.tracking_rate_gain = self.controller.tracking_rate_gain * bandwidth
         self.flatness_controller = FlatnessAttitudeController(self.cfg)
         self.alpha_motor_filter = None
         self.alpha_flap_filter = None
@@ -52,11 +99,15 @@ class AlphaTailsitterController(TailsitterController):
         self.flap_angle_lpf = np.zeros(2)
         self.flap_angle_hpf = np.zeros(2)
         self.flap_angle_without_transient = np.zeros(2)
+        self.world_force_filter = None
+        self.world_flap_force_filter = None
         self.alpha_debug_publisher = self.create_publisher(
             Float64MultiArray, '/phoenix_tailsitter/alpha_model_debug', 10)
         # Same-cycle current/reference TS-to-NED quaternions [w, x, y, z].
         self.attitude_tracking_publisher = self.create_publisher(
             Float64MultiArray, '/phoenix_tailsitter/attitude_tracking_debug', 10)
+        self.reference_debug_publisher = self.create_publisher(
+            Float64MultiArray, '/phoenix_tailsitter/reference_debug', 10)
         self.get_logger().warning(
             'Full alpha-theory controller selected; aerodynamic IDENTIFY '
             'defaults are provisional PhoenixDrone starting values.')
@@ -77,6 +128,8 @@ class AlphaTailsitterController(TailsitterController):
         if hasattr(self, 'motor_speed_lpf'):
             self._reset_alpha_filters()
             self.tracking_gain_blend = 0.0
+            self.world_force_filter = None
+            self.world_flap_force_filter = None
 
     def _update_alpha_filters(self):
         if self.alpha_motor_filter is None:
@@ -167,6 +220,30 @@ class AlphaTailsitterController(TailsitterController):
             self.get_logger().error(f'Invalid trajectory setpoint: {error}')
             return None
         self.trajectory_yaw = reference.yaw
+        reference_age, common_clock = trajectory_reference_age(
+            self.trajectory_setpoint.timestamp, now_ns,
+            self.trajectory_setpoint_arrival_ns,
+            self.cfg.trajectory_prediction_horizon_s, self.cfg.setpoint_timeout_s)
+        if self.trajectory_prediction_enabled:
+            reference = advance_trajectory_reference(reference, reference_age,
+                advance_yaw=math.isfinite(float(self.trajectory_setpoint.yaw)))
+        motion_target = maneuver_gain_target(reference, self.cfg)
+        self.reference_has_explicit_acceleration = bool(np.any(reference.acceleration_mask))
+        if self.motion_gain_scheduling_enabled:
+            self.tracking_gain_blend = update_gain_blend(
+                self.tracking_gain_blend, motion_target, self.filter_dt_s,
+                self.cfg.maneuver_gain_transition_s)
+            self.motion_schedule_updated = True
+        reference_debug = Float64MultiArray()
+        # Prediction age, common clock, prediction enabled, requested-motion
+        # blend target, applied blend, scheduling enabled, matched world-force
+        # filtering enabled, reference-rate body transport enabled.
+        reference_debug.data = [reference_age, float(common_clock),
+            float(self.trajectory_prediction_enabled), motion_target,
+            self.tracking_gain_blend, float(self.motion_gain_scheduling_enabled),
+            float(self.world_force_filter_enabled),
+            float(self.transport_feedforward_rates_enabled)]
+        self.reference_debug_publisher.publish(reference_debug)
 
         if self.linear_acceleration_filter is None:
             self.linear_acceleration_filter = TimeAwareButterworth(
@@ -178,14 +255,34 @@ class AlphaTailsitterController(TailsitterController):
         acceleration_lpf = self.linear_acceleration_filter.update(
             acceleration, self.filter_dt_s)
 
-        flap_transient = self.aerodynamics.compute(
-            velocity_body_ts,
-            self.motor_speed_lpf,
-            self.flap_angle_hpf,
-        ).flap_force_alpha
+        if self.world_force_filter_enabled:
+            # Filter the complete world-frame wrench, including its changing
+            # orientation and velocity dependence, at the same cutoff as a.
+            # Filtering only actuator inputs and then applying the current R
+            # gives the model force a different phase from measured NED a.
+            raw_model = self.aerodynamics.compute(
+                velocity_body_ts, self.motor_speed_estimate, self.flap_angle_estimate)
+            raw_transient = self.aerodynamics.compute(
+                velocity_body_ts, self.motor_speed_estimate, self.flap_angle_hpf)
+            total_world = r_alpha_to_ned @ raw_model.force_alpha
+            transient_world = r_alpha_to_ned @ raw_transient.flap_force_alpha
+            if self.world_force_filter is None:
+                self.world_force_filter = TimeAwareButterworth(
+                    self.cfg.indi_lpf_cutoff_hz, self.cfg.control_rate_hz, 3, total_world)
+                self.world_flap_force_filter = TimeAwareButterworth(
+                    self.cfg.indi_lpf_cutoff_hz, self.cfg.control_rate_hz, 3, transient_world)
+            total_world_lpf = self.world_force_filter.update(total_world, self.filter_dt_s)
+            transient_world_lpf = self.world_flap_force_filter.update(transient_world, self.filter_dt_s)
+            estimated_force_lpf_ned = total_world_lpf - transient_world_lpf
+        else:
+            flap_transient = self.aerodynamics.compute(
+                velocity_body_ts, self.motor_speed_lpf, self.flap_angle_hpf).flap_force_alpha
+            transient_world_lpf = r_alpha_to_ned @ flap_transient
+            steady_model = self.aerodynamics.compute(
+                velocity_body_ts, self.motor_speed_lpf, self.flap_angle_without_transient)
+            estimated_force_lpf_ned = r_alpha_to_ned @ steady_model.force_alpha
         acceleration_without_flap_transient = (
-            acceleration_lpf
-            - r_alpha_to_ned @ flap_transient / self.cfg.mass)
+            acceleration_lpf - transient_world_lpf / self.cfg.mass)
 
         acceleration_command = self.position_controller.acceleration_command(
             reference,
@@ -193,13 +290,11 @@ class AlphaTailsitterController(TailsitterController):
             velocity,
             acceleration_without_flap_transient,
             r_ts_to_ned,
+            tracking_blend=(self.tracking_gain_blend
+                if self.motion_gain_scheduling_enabled else None),
+            trajectory_mode=(self.motion_gain_scheduling_enabled
+                             and self.reference_has_explicit_acceleration),
         )
-        steady_model = self.aerodynamics.compute(
-            velocity_body_ts,
-            self.motor_speed_lpf,
-            self.flap_angle_without_transient,
-        )
-        estimated_force_lpf_ned = r_alpha_to_ned @ steady_model.force_alpha
         force_command = self.linear_controller.force_command(
             acceleration_command,
             acceleration_without_flap_transient,
@@ -216,6 +311,7 @@ class AlphaTailsitterController(TailsitterController):
             position,
             reference,
             self.cfg,
+            ground_only=self.ground_only_takeoff_force_floor,
         )
         flap_sum = float(np.sum(self.flap_angle_without_transient))
         try:
@@ -227,7 +323,7 @@ class AlphaTailsitterController(TailsitterController):
                     reference.yaw,
                     q_current_ts,
                 ))
-            _, _, reference_roll, reference_pitch_bar = (
+            reference_q_ts, _, reference_roll, reference_pitch_bar = (
                 self.flatness_controller.attitude_and_thrust(
                     reference_force,
                     reference.velocity,
@@ -247,6 +343,9 @@ class AlphaTailsitterController(TailsitterController):
                 reference_pitch_bar,
                 flap_sum,
             )
+            if self.transport_feedforward_rates_enabled:
+                desired_rates_ts = transport_reference_rates(
+                    q_current_ts, reference_q_ts, desired_rates_ts)
         except ValueError as error:
             self.get_logger().error(f'Flatness transform failed: {error}')
             return None
@@ -403,6 +502,8 @@ class AlphaTailsitterController(TailsitterController):
         self._publish_alpha_debug(
             velocity_body_ts, model_result, flap_transient)
 
+        self.motion_schedule_updated = False
+        self.reference_has_explicit_acceleration = False
         desired = self._desired_state(now_ns, q_current_ts)
         if desired is None:
             if output_active and self.previous_output_active:
@@ -416,6 +517,15 @@ class AlphaTailsitterController(TailsitterController):
             self._publish_actuators(timestamp_us, np.zeros(2), np.zeros(2))
             return
 
+        # A complete raw model moment receives the same single LPF as gyro
+        # feedback. Filtering actuator inputs and then the model moment adds
+        # a second lag on only one side of the angular INDI increment.
+        estimated_moment = model_result.moment_body_ts
+        if self.matched_moment_filter_enabled:
+            estimated_moment = self.aerodynamics.compute(
+                velocity_body_ts, self.motor_speed_estimate,
+                self.flap_angle_estimate).moment_body_ts
+
         if self.rate_filter is None:
             self.rate_filter = TimeAwareButterworth(
                 self.cfg.indi_lpf_cutoff_hz,
@@ -427,7 +537,7 @@ class AlphaTailsitterController(TailsitterController):
                 self.cfg.indi_lpf_cutoff_hz,
                 self.cfg.control_rate_hz,
                 3,
-                model_result.moment_body_ts,
+                estimated_moment,
             )
             self.previous_rate_lpf = rates_ts.copy()
 
@@ -436,7 +546,7 @@ class AlphaTailsitterController(TailsitterController):
             rates_lpf_ts - self.previous_rate_lpf) / dt
         self.previous_rate_lpf = rates_lpf_ts.copy()
         estimated_moment_lpf = self.moment_filter.update(
-            model_result.moment_body_ts, dt)
+            estimated_moment, dt)
 
         desired_q_ts, total_thrust, desired_rates_ts = desired
         attitude_tracking = Float64MultiArray()
@@ -447,19 +557,34 @@ class AlphaTailsitterController(TailsitterController):
             source == 'trajectory'
             and self.trajectory_setpoint is not None
             and np.any(np.isfinite(self.trajectory_setpoint.acceleration)))
-        self.tracking_gain_blend = float(np.clip(
-            self.tracking_gain_blend + (dt if tracking else -dt), 0.0, 1.0))
-        acceleration_command = self.controller.angular_acceleration_command(
+        if not self.motion_gain_scheduling_enabled:
+            self.tracking_gain_blend = float(np.clip(
+                self.tracking_gain_blend + (dt if tracking else -dt), 0.0, 1.0))
+        elif not self.motion_schedule_updated:
+            self.tracking_gain_blend = update_gain_blend(
+                self.tracking_gain_blend, 0.0, dt,
+                self.cfg.maneuver_gain_transition_s)
+        attitude_controller = (self.maneuver_controller
+                               if self.reference_has_explicit_acceleration else self.controller)
+        acceleration_command = attitude_controller.angular_acceleration_command(
             q_current_ts,
             desired_q_ts,
             rates_lpf_ts,
             desired_rates_ts,
             tracking_blend=self.tracking_gain_blend,
+            trajectory_mode=(self.motion_gain_scheduling_enabled
+                             and self.reference_has_explicit_acceleration),
+            acceleration_limit_scale=(1.0 + self.tracking_gain_blend * (
+                self.maneuver_acceleration_limit_scale - 1.0)
+                if self.reference_has_explicit_acceleration else 1.0),
         )
         desired_moment = self.controller.moment_command(
             acceleration_command,
             acceleration_lpf_ts,
             estimated_moment_lpf,
+            moment_limit_scale=(1.0 + self.tracking_gain_blend * (
+                self.maneuver_moment_limit_scale - 1.0)
+                if self.reference_has_explicit_acceleration else 1.0),
         )
         allocation = self.allocator.allocate(
             total_thrust, desired_moment, velocity_body_ts)

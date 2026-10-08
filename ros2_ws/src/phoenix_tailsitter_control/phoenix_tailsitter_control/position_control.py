@@ -4,7 +4,7 @@ World vectors stay in PX4 NED.  Body-dependent gains and force estimates use
 the Tailsitter-control body basis through the supplied ``R_ts_to_ned`` matrix.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 
 import numpy as np
@@ -82,6 +82,71 @@ def resolve_trajectory_reference(message, position, velocity, fallback_yaw):
     )
 
 
+def trajectory_reference_age(timestamp_us, now_ns, arrival_ns,
+                             maximum_age_s=0.10, clock_tolerance_s=0.50):
+    """Use a common-clock publisher stamp, otherwise the local arrival clock.
+
+    PX4-style stamps may be boot-relative whereas ROS stamps are epoch-relative.
+    Never extrapolate across that clock-domain difference, into negative time,
+    or past the bounded prediction horizon. Freshness gating remains separate.
+    """
+    if not math.isfinite(maximum_age_s) or maximum_age_s <= 0.0:
+        raise ValueError('prediction horizon must be finite and positive')
+    timestamp_ns = int(timestamp_us) * 1000
+    common_clock = (timestamp_ns > 0 and
+                    abs(timestamp_ns - arrival_ns) * 1e-9 <= clock_tolerance_s)
+    origin_ns = timestamp_ns if common_clock else arrival_ns
+    age = float(np.clip((now_ns - origin_ns) * 1e-9, 0.0, maximum_age_s))
+    return age, common_clock
+
+
+def advance_trajectory_reference(reference, age_s, *, advance_yaw=True):
+    """Evaluate the message's p/v/a/jerk polynomial at the control time.
+
+    Preserve the resolved control masks: acceleration-only commands must not
+    silently acquire position or velocity feedback, and position-only holds
+    still resolve unspecified derivatives to zero.
+    """
+    if not math.isfinite(age_s) or age_s < 0.0:
+        raise ValueError('reference age must be finite and nonnegative')
+    dt = float(age_s)
+    a = reference.acceleration
+    j = np.where(reference.acceleration_mask, reference.jerk, 0.0)
+    p = reference.position + reference.velocity * dt + a * dt**2 / 2 + j * dt**3 / 6
+    v = reference.velocity + a * dt + j * dt**2 / 2
+    return replace(reference,
+        position=np.where(reference.position_mask, p, reference.position),
+        velocity=np.where(reference.velocity_mask, v, reference.velocity),
+        acceleration=np.where(reference.acceleration_mask, a + j * dt, a),
+        yaw=reference.yaw + (reference.yawspeed * dt if advance_yaw else 0.0))
+
+
+def maneuver_gain_target(reference, config):
+    """A stationary finite-acceleration reference is hover, not a maneuver.
+
+    NaN-acceleration staging references retain their existing low-speed gains.
+    Explicit trajectories blend continuously with requested motion, independent
+    of tracking error or measured speed, so an oscillating hover stays in hover.
+    """
+    if not np.any(reference.acceleration_mask):
+        return 0.0
+    activity = max(
+        float(np.linalg.norm(np.where(reference.velocity_mask, reference.velocity, 0.0))) / config.maneuver_speed_threshold,
+        float(np.linalg.norm(np.where(reference.acceleration_mask, reference.acceleration, 0.0))) / config.maneuver_acceleration_threshold,
+        abs(reference.yawspeed) / config.maneuver_yaw_rate_threshold)
+    u = float(np.clip(activity, 0.0, 1.0))
+    return u * u * (3.0 - 2.0 * u)
+
+
+def update_gain_blend(current, target, dt, transition_s):
+    if (not all(math.isfinite(x) for x in (current, target, dt, transition_s))
+            or not 0 <= current <= 1 or not 0 <= target <= 1
+            or dt <= 0 or transition_s <= 0):
+        raise ValueError('gain blend requires bounded gains and positive timing')
+    step = dt / transition_s
+    return float(current + np.clip(target - current, -step, step))
+
+
 class PositionController:
     """Body-gain position feedback ported from Tailsitter-control Eq. 41."""
 
@@ -95,7 +160,8 @@ class PositionController:
         return vector if magnitude <= limit else vector * (limit / magnitude)
 
     def acceleration_command(self, reference, position, velocity,
-                             acceleration_lpf_ned, r_ts_to_ned):
+                             acceleration_lpf_ned, r_ts_to_ned,
+                             tracking_blend=None, trajectory_mode=False):
         position_error = np.where(
             reference.position_mask, reference.position - position, 0.0)
         velocity_error = np.where(
@@ -108,13 +174,14 @@ class PositionController:
         velocity_error = np.clip(
             velocity_error, -self.cfg.velocity_error_limit,
             self.cfg.velocity_error_limit)
-        tracking_reference = bool(np.any(reference.acceleration_mask))
-        position_gain = (
-            self.cfg.tracking_position_gain
-            if tracking_reference else self.cfg.position_gain)
-        velocity_gain = (
-            self.cfg.tracking_velocity_gain
-            if tracking_reference else self.cfg.velocity_gain)
+        if tracking_blend is None:
+            tracking_blend = float(np.any(reference.acceleration_mask))
+        if not math.isfinite(tracking_blend) or not 0 <= tracking_blend <= 1:
+            raise ValueError('tracking blend must be between zero and one')
+        position_gain = self.cfg.position_gain + tracking_blend * (
+            self.cfg.tracking_position_gain - self.cfg.position_gain)
+        velocity_gain = self.cfg.velocity_gain + tracking_blend * (
+            self.cfg.tracking_velocity_gain - self.cfg.velocity_gain)
         r_ned_to_ts = np.asarray(r_ts_to_ned, dtype=float).T
         feedback_ts = (
             position_gain * (r_ned_to_ts @ position_error)
@@ -123,12 +190,14 @@ class PositionController:
             * (r_ned_to_ts @ acceleration_error)
         )
         feedback_ned = r_ts_to_ned @ feedback_ts
-        horizontal_limit = (
-            self.cfg.tracking_horizontal_acceleration_limit
-            if tracking_reference else self.cfg.horizontal_acceleration_limit)
-        vertical_limit = (
-            self.cfg.tracking_vertical_acceleration_limit
-            if tracking_reference else self.cfg.vertical_acceleration_limit)
+        low_horizontal = (self.cfg.trajectory_hover_horizontal_acceleration_limit
+                          if trajectory_mode else self.cfg.horizontal_acceleration_limit)
+        low_vertical = (self.cfg.trajectory_hover_vertical_acceleration_limit
+                        if trajectory_mode else self.cfg.vertical_acceleration_limit)
+        horizontal_limit = low_horizontal + tracking_blend * (
+            self.cfg.tracking_horizontal_acceleration_limit - low_horizontal)
+        vertical_limit = low_vertical + tracking_blend * (
+            self.cfg.tracking_vertical_acceleration_limit - low_vertical)
         horizontal_feedback = self._limit_norm(
             feedback_ned[:2], horizontal_limit)
         limited_feedback = np.array([
@@ -188,7 +257,7 @@ class LinearAccelerationINDIController:
 
 
 def apply_takeoff_force_floor(force_ned, nominal_force_ned, estimated_force_ned,
-                              position_ned, reference, config):
+                              position_ned, reference, config, *, ground_only=False):
     """Keep ground-start INDI takeoff from losing gravity compensation."""
     force = np.asarray(force_ned, dtype=float).copy()
     nominal = np.asarray(nominal_force_ned, dtype=float)
@@ -197,6 +266,11 @@ def apply_takeoff_force_floor(force_ned, nominal_force_ned, estimated_force_ned,
     values = (force, nominal, estimated, position)
     if any(value.shape != (3,) or not np.all(np.isfinite(value)) for value in values):
         raise ValueError('takeoff force floor inputs must be finite 3-vectors')
+
+    # PX4 local NED is referenced to the takeoff surface in this SITL path.
+    # An airborne loss of lift must not cancel the maneuver's horizontal force.
+    if ground_only and -position[2] > 2.0:
+        return force
 
     climbing_reference = (
         bool(reference.position_mask[2] and reference.position[2] < position[2] - 0.05)
